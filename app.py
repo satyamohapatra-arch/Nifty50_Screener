@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
-SHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE"   # ← replace with your sheet ID
+SHEET_ID = "1YsfDm4dFFM8aUfOS7uvIWDvphkSM39xOtlalgTUgkhM"   # ← replace with your sheet ID - {completed}
 SCOPES   = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
