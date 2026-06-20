@@ -24,7 +24,7 @@ import zoneinfo
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-SHEET_ID   = "1YsfDm4dFFM8aUfOS7uvIWDvphkSM39xOtlalgTUgkhM"          # ← replace
+SHEET_ID   = "1YsfDm4dFFM8aUfOS7uvIWDvphkSM39xOtlalgTUgkhM"
 MASTER_CSV = "nifty50_master.csv"
 SCOPES     = [
     "https://spreadsheets.google.com/feeds",
@@ -34,11 +34,11 @@ SCOPES     = [
 # Nifty 50 tickers (NSE)
 NIFTY50_TICKERS = [
     "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK",
-    "INFOSYS","SBILIFE","HINDUNILVR","ITC","LT",
+    "INFY","SBILIFE","HINDUNILVR","ITC","LT",
     "KOTAKBANK","HCLTECH","BAJFINANCE","MARUTI","AXISBANK",
     "ASIANPAINT","NESTLEIND","SUNPHARMA","TITAN","ULTRACEMCO",
     "WIPRO","NTPC","TECHM","POWERGRID","BAJAJFINSV",
-    "ADANIENT","ADANIPORTS","ONGC","TATAMOTORS","TATASTEEL",
+    "ADANIENT","ADANIPORTS","ONGC","TATAmotors","TATASTEEL",
     "SBIN","M&M","JSWSTEEL","COALINDIA","DIVISLAB",
     "DRREDDY","BRITANNIA","CIPLA","APOLLOHOSP","EICHERMOT",
     "GRASIM","HEROMOTOCO","HINDALCO","INDUSINDBK","BPCL",
@@ -51,30 +51,24 @@ OUTPUT_COLS = [
     "Date","Stock","Sector",
     "Open","High","Low","Close","Volume",
     "Prev_Close","Returns",
-    # Trend
     "EMA_10","EMA_20","SMA_50","Supertrend","Supertrend_Signal",
-    # Momentum
     "RSI_14","MACD_line","MACD_signal","MACD_hist",
     "Stoch_K","Stoch_D",
-    # Volatility
     "ATR_14","BB_Upper","BB_Middle","BB_Lower","BB_pctB",
-    # Volume
     "OBV","VWAP",
-    # Trend strength
     "ADX_14","DI_Plus","DI_Minus",
-    # Strategy flags
     "Absolute_Longs","Bottom_Fishing",
 ]
 
 SECTOR_MAP = {
     "RELIANCE":"Energy","TCS":"IT","HDFCBANK":"Banking","BHARTIARTL":"Telecom",
-    "ICICIBANK":"Banking","INFOSYS":"IT","SBILIFE":"Insurance","HINDUNILVR":"FMCG",
+    "ICICIBANK":"Banking","INFY":"IT","SBILIFE":"Insurance","HINDUNILVR":"FMCG",
     "ITC":"FMCG","LT":"Capital Goods","KOTAKBANK":"Banking","HCLTECH":"IT",
     "BAJFINANCE":"NBFC","MARUTI":"Auto","AXISBANK":"Banking","ASIANPAINT":"Paints",
     "NESTLEIND":"FMCG","SUNPHARMA":"Pharma","TITAN":"Consumer","ULTRACEMCO":"Cement",
     "WIPRO":"IT","NTPC":"Power","TECHM":"IT","POWERGRID":"Power","BAJAJFINSV":"NBFC",
     "ADANIENT":"Conglomerate","ADANIPORTS":"Infrastructure","ONGC":"Energy",
-    "TATAMOTORS":"Auto","TATASTEEL":"Metals","SBIN":"Banking","M&M":"Auto",
+    "TATAMOTOS":"Auto","TATASTEEL":"Metals","SBIN":"Banking","M&M":"Auto",
     "JSWSTEEL":"Metals","COALINDIA":"Energy","DIVISLAB":"Pharma","DRREDDY":"Pharma",
     "BRITANNIA":"FMCG","CIPLA":"Pharma","APOLLOHOSP":"Healthcare","EICHERMOT":"Auto",
     "GRASIM":"Cement","HEROMOTOCO":"Auto","HINDALCO":"Metals","INDUSINDBK":"Banking",
@@ -108,8 +102,8 @@ def last_trading_day():
 # ── DOWNLOAD ──────────────────────────────────────────────────────────────────
 
 def download_nifty50(log=print):
-    end_date   = last_trading_day()
-    fetch_end  = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    end_date  = last_trading_day()
+    fetch_end = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
     if os.path.exists(MASTER_CSV):
         existing   = pd.read_csv(MASTER_CSV, parse_dates=["Date"])
@@ -123,7 +117,7 @@ def download_nifty50(log=print):
         log("Data already up to date.")
         return pd.read_csv(MASTER_CSV, parse_dates=["Date"])
 
-    log(f"Fetching {len(NIFTY50_BOLS)} stocks from {start_date} → {end_date}")
+    log(f"Fetching {len(NIFTY50_SYMBOLS)} stocks from {start_date} to {end_date}")
     all_rows = []
 
     for sym in NIFTY50_SYMBOLS:
@@ -132,27 +126,39 @@ def download_nifty50(log=print):
                              interval="1d", auto_adjust=False,
                              progress=False, group_by="ticker")
             if df.empty:
+                log(f"  ! {sym}: empty data, skipping")
                 continue
-            # Flatten MultiIndex columns regardless of shape
+
+            # Flatten MultiIndex columns
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = ["_".join([c for c in col if c]).strip("_")
                               for col in df.columns]
-                # rename ticker-prefixed columns e.g. RELIANCE_NS_Close -> Close
                 rename = {}
                 for c in df.columns:
                     for base in ["Open","High","Low","Close","Volume","Adj Close"]:
                         if c.endswith(base):
                             rename[c] = base
                 df = df.rename(columns=rename)
+
             df = df.reset_index()
-            # Ensure Date column exists
+
             if "Date" not in df.columns and "index" in df.columns:
                 df = df.rename(columns={"index": "Date"})
-            df = df[["Date","Open","High","Low","Close","Volume"]].copy()
-            df["Stock"] = sym
+
+            # Keep only needed columns
+            keep = [c for c in ["Date","Open","High","Low","Close","Volume"] if c in df.columns]
+            df = df[keep].copy()
+
+            if "Close" not in df.columns:
+                log(f"  ! {sym}: Close column missing, skipping")
+                continue
+
+            df["Stock"]  = sym
             ticker_name  = sym.replace(".NS","")
             df["Sector"] = SECTOR_MAP.get(ticker_name, "Other")
             all_rows.append(df)
+            log(f"  ✓ {sym}: {len(df)} rows")
+
         except Exception as e:
             log(f"  ✗ {sym}: {e}")
 
@@ -164,7 +170,7 @@ def download_nifty50(log=print):
 
     if existing is not None:
         combined = pd.concat([existing, new_data], ignore_index=True)
-        combined = combined.drop_duplicates(sset=["Date","Stock"])
+        combined = combined.drop_duplicates(subset=["Date","Stock"])
     else:
         combined = new_data
 
@@ -175,20 +181,20 @@ def download_nifty50(log=print):
 # ── INDICATORS ────────────────────────────────────────────────────────────────
 
 def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
-    data = data.sort_values("Date").copy()
+    data  = data.sort_values("Date").copy()
     close = data["Close"].astype(float)
     high  = data["High"].astype(float)
     low   = data["Low"].astype(float)
     vol   = data["Volume"].astype(float)
 
-    # ── EMA ──────────────────────────────────────────────────────────────────
+    # EMA
     data["EMA_10"] = close.ewm(span=10, adjust=False).mean()
     data["EMA_20"] = close.ewm(span=20, adjust=False).mean()
 
-    # ── SMA ──────────────────────────────────────────────────────────────────
+    # SMA
     data["SMA_50"] = close.rolling(50).mean()
 
-    # ── RSI ──────────────────────────────────────────────────────────────────
+    # RSI
     delta    = close.diff()
     gain     = delta.clip(lower=0)
     loss     = (-delta).clip(lower=0)
@@ -197,14 +203,14 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     rs       = avg_gain / (avg_loss + 1e-10)
     data["RSI_14"] = 100 - (100 / (1 + rs))
 
-    # ── MACD ─────────────────────────────────────────────────────────────────
+    # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     data["MACD_line"]   = ema12 - ema26
     data["MACD_signal"] = data["MACD_line"].ewm(span=9, adjust=False).mean()
     data["MACD_hist"]   = data["MACD_line"] - data["MACD_signal"]
 
-    # ── ATR ──────────────────────────────────────────────────────────────────
+    # ATR
     hl  = high - low
     hc  = (high - close.shift()).abs()
     lc  = (low  - close.shift()).abs()
@@ -212,13 +218,13 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     atr = tr.ewm(span=14, adjust=False).mean()
     data["ATR_14"] = atr
 
-    # ── Supertrend (ATR multiplier = 3) ──────────────────────────────────────
-    hl2   = (high + low) / 2
+    # Supertrend
+    hl2        = (high + low) / 2
     upper_band = hl2 + 3 * atr
     lower_band = hl2 - 3 * atr
 
     supertrend = [np.nan] * len(data)
-    direction  = [1] * len(data)          # 1 = BUY, -1 = SELL
+    direction  = [1] * len(data)
 
     cl = close.values
     ub = upper_band.values.copy()
@@ -227,16 +233,9 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     for i in range(1, len(data)):
         if np.isnan(atr.values[i]):
             continue
-        # Adjust bands
-        if lb[i] > lb[i-1] or cl[i-1] < lb[i-1]:
-            lb[i] = lb[i]
-        else:
-            lb[i] = lb[i-1]
 
-        if ub[i] < ub[i-1] or cl[i-1] > ub[i-1]:
-            ub[i] = ub[i]
-        else:
-            ub[i] = ub[i-1]
+        lb[i] = lb[i] if (lb[i] > lb[i-1] or cl[i-1] < lb[i-1]) else lb[i-1]
+        ub[i] = ub[i] if (ub[i] < ub[i-1] or cl[i-1] > ub[i-1]) else ub[i-1]
 
         if direction[i-1] == -1 and cl[i] > ub[i]:
             direction[i] = 1
@@ -250,21 +249,21 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     data["Supertrend"]        = supertrend
     data["Supertrend_Signal"] = ["BUY" if d == 1 else "SELL" for d in direction]
 
-    # ── Bollinger Bands (20, 2σ) ──────────────────────────────────────────────
-    bb_mid             = close.rolling(20).mean()
-    bb_std             = close.rolling(20).std()
-    data["BB_Middle"]  = bb_mid
-    data["BB_Upper"]   = bb_mid + 2 * bb_std
-    data["BB_Lower"]   = bb_mid - 2 * bb_std
-    data["BB_pctB"]    = (close - data["BB_Lower"]) / (data["BB_Upper"] - data["BB_Lower"] + 1e-10)
+    # Bollinger Bands
+    bb_mid            = close.rolling(20).mean()
+    bb_std            = close.rolling(20).std()
+    data["BB_Middle"] = bb_mid
+    data["BB_Upper"]  = bb_mid + 2 * bb_std
+    data["BB_Lower"]  = bb_mid - 2 * bb_std
+    data["BB_pctB"]   = (close - data["BB_Lower"]) / (data["BB_Upper"] - data["BB_Lower"] + 1e-10)
 
-    # ── Stochastics (14,3) ────────────────────────────────────────────────────
-    low14        = low.rolling(14).min()
-    high14       = high.rolling(14).max()
+    # Stochastics
+    low14           = low.rolling(14).min()
+    high14          = high.rolling(14).max()
     data["Stoch_K"] = 100 * (close - low14) / (high14 - low14 + 1e-10)
     data["Stoch_D"] = data["Stoch_K"].rolling(3).mean()
 
-    # ── OBV ──────────────────────────────────────────────────────────────────
+    # OBV
     obv = [0.0]
     for i in range(1, len(data)):
         if cl[i] > cl[i-1]:
@@ -275,11 +274,11 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
             obv.append(obv[-1])
     data["OBV"] = obv
 
-    # ── VWAP (daily approx using cumulative since first row in window) ────────
-    tp            = (high + low + close) / 3
-    data["VWAP"]  = (tp * vol).cumsum() / (vol.cumsum() + 1e-10)
+    # VWAP
+    tp           = (high + low + close) / 3
+    data["VWAP"] = (tp * vol).cumsum() / (vol.cumsum() + 1e-10)
 
-    # ── ADX / DMI ─────────────────────────────────────────────────────────────
+    # ADX / DMI
     up_move   = high.diff()
     down_move = (-low.diff())
     plus_dm   = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
@@ -292,16 +291,15 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     data["DI_Plus"]  = 100 * smoothed_plus_dm  / (smoothed_tr + 1e-10)
     data["DI_Minus"] = 100 * smoothed_minus_dm / (smoothed_tr + 1e-10)
 
-    dx = 100 * (data["DI_Plus"] - data["DI_Minus"]).abs() / \
-         (data["DI_Plus"] + data["DI_Minus"] + 1e-10)
+    dx             = 100 * (data["DI_Plus"] - data["DI_Minus"]).abs() / \
+                     (data["DI_Plus"] + data["DI_Minus"] + 1e-10)
     data["ADX_14"] = dx.ewm(span=14, adjust=False).mean()
 
-    # ── Returns ───────────────────────────────────────────────────────────────
+    # Returns
     data["Prev_Close"] = close.shift(1)
     data["Returns"]    = close.pct_change() * 100
 
-    # ── Strategy Flags ────────────────────────────────────────────────────────
-    # Absolute Longs: full bullish convergence
+    # Strategy Flags
     data["Absolute_Longs"] = (
         (data["EMA_10"] > data["EMA_20"]) &
         (data["RSI_14"] > 50) &
@@ -309,7 +307,6 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
         (data["Supertrend_Signal"] == "BUY")
     ).map({True: "YES", False: "NO"})
 
-    # Bottom-Fishing: short-term bullish, macro still bearish
     data["Bottom_Fishing"] = (
         (data["EMA_10"] > data["EMA_20"]) &
         (data["RSI_14"] > 50) &
@@ -322,7 +319,6 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
 # ── RUN ───────────────────────────────────────────────────────────────────────
 
 def run(log=print):
-    # 1. Download / update OHLCV
     master = download_nifty50(log=log)
     if master.empty:
         log("No data. Aborting.")
@@ -330,14 +326,12 @@ def run(log=print):
 
     master["Date"] = pd.to_datetime(master["Date"])
 
-    # 2. Compute indicators per stock
-    log("Computing indicators for all 50 stocks...")
+    log("Computing indicators for all stocks...")
     processed = (
         master.groupby("Stock", group_keys=False)
         .apply(compute_indicators)
     )
 
-    # 3. Take latest row per stock
     latest = (
         processed.sort_values("Date")
         .groupby("Stock", group_keys=False)
@@ -345,7 +339,6 @@ def run(log=print):
         .reset_index(drop=True)
     )
 
-    # 4. Select and round output columns
     available = [c for c in OUTPUT_COLS if c in latest.columns]
     latest    = latest[available].copy()
 
@@ -356,7 +349,6 @@ def run(log=print):
 
     log(f"Snapshot ready: {len(latest)} stocks")
 
-    # 5. Push to Google Sheets
     log("Pushing to Google Sheets...")
     gc        = get_gspread_client()
     sh        = gc.open_by_key(SHEET_ID)
