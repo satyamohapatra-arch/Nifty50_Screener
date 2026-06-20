@@ -150,7 +150,7 @@ def download_nifty50(log=print):
 
     if existing is not None:
         combined = pd.concat([existing, new_data], ignore_index=True)
-        combined = combined.drop_duplicates(subset=["Date","Stock"])
+        combined = combined.drop_duplicates(sset=["Date","Stock"])
     else:
         combined = new_data
 
@@ -207,8 +207,8 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     direction  = [1] * len(data)          # 1 = BUY, -1 = SELL
 
     cl = close.values
-    ub = upper_band.values
-    lb = lower_band.values
+    ub = upper_band.values.copy()
+    lb = lower_band.values.copy()
 
     for i in range(1, len(data)):
         if np.isnan(atr.values[i]):
