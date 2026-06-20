@@ -31,14 +31,13 @@ SCOPES     = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Nifty 50 tickers (NSE)
 NIFTY50_TICKERS = [
     "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK",
     "INFY","SBILIFE","HINDUNILVR","ITC","LT",
     "KOTAKBANK","HCLTECH","BAJFINANCE","MARUTI","AXISBANK",
     "ASIANPAINT","NESTLEIND","SUNPHARMA","TITAN","ULTRACEMCO",
     "WIPRO","NTPC","TECHM","POWERGRID","BAJAJFINSV",
-    "ADANIENT","ADANIPORTS","ONGC","TATAmotors","TATASTEEL",
+    "ADANIENT","ADANIPORTS","ONGC","TATAMOTORS","TATASTEEL",
     "SBIN","M&M","JSWSTEEL","COALINDIA","DIVISLAB",
     "DRREDDY","BRITANNIA","CIPLA","APOLLOHOSP","EICHERMOT",
     "GRASIM","HEROMOTOCO","HINDALCO","INDUSINDBK","BPCL",
@@ -68,7 +67,7 @@ SECTOR_MAP = {
     "NESTLEIND":"FMCG","SUNPHARMA":"Pharma","TITAN":"Consumer","ULTRACEMCO":"Cement",
     "WIPRO":"IT","NTPC":"Power","TECHM":"IT","POWERGRID":"Power","BAJAJFINSV":"NBFC",
     "ADANIENT":"Conglomerate","ADANIPORTS":"Infrastructure","ONGC":"Energy",
-    "TATAMOTOS":"Auto","TATASTEEL":"Metals","SBIN":"Banking","M&M":"Auto",
+    "TATAMOTORS":"Auto","TATASTEEL":"Metals","SBIN":"Banking","M&M":"Auto",
     "JSWSTEEL":"Metals","COALINDIA":"Energy","DIVISLAB":"Pharma","DRREDDY":"Pharma",
     "BRITANNIA":"FMCG","CIPLA":"Pharma","APOLLOHOSP":"Healthcare","EICHERMOT":"Auto",
     "GRASIM":"Cement","HEROMOTOCO":"Auto","HINDALCO":"Metals","INDUSINDBK":"Banking",
@@ -145,7 +144,6 @@ def download_nifty50(log=print):
             if "Date" not in df.columns and "index" in df.columns:
                 df = df.rename(columns={"index": "Date"})
 
-            # Keep only needed columns
             keep = [c for c in ["Date","Open","High","Low","Close","Volume"] if c in df.columns]
             df = df[keep].copy()
 
@@ -178,7 +176,7 @@ def download_nifty50(log=print):
     log(f"Master CSV: {len(combined):,} rows.")
     return combined
 
-# ── INDICATORS ────────────────────────────────────────────────────────────────
+# ── INDICATORS (per stock, no groupby) ───────────────────────────────────────
 
 def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     data  = data.sort_values("Date").copy()
@@ -233,7 +231,6 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     for i in range(1, len(data)):
         if np.isnan(atr.values[i]):
             continue
-
         lb[i] = lb[i] if (lb[i] > lb[i-1] or cl[i-1] < lb[i-1]) else lb[i-1]
         ub[i] = ub[i] if (ub[i] < ub[i-1] or cl[i-1] > ub[i-1]) else ub[i-1]
 
@@ -326,18 +323,23 @@ def run(log=print):
 
     master["Date"] = pd.to_datetime(master["Date"])
 
+    # ── KEY FIX: loop per stock instead of groupby.apply ──────────────────────
     log("Computing indicators for all stocks...")
-    processed = (
-        master.groupby("Stock", group_keys=False)
-        .apply(compute_indicators)
-    )
+    latest_rows = []
 
-    latest = (
-        processed.sort_values("Date")
-        .groupby("Stock", group_keys=False)
-        .apply(lambda x: x.iloc[-1])
-        .reset_index(drop=True)
-    )
+    for sym in master["Stock"].unique():
+        try:
+            stock_df = master[master["Stock"] == sym].copy()
+            stock_df = compute_indicators(stock_df)
+            latest_rows.append(stock_df.iloc[-1])
+        except Exception as e:
+            log(f"  ✗ indicators failed for {sym}: {e}")
+
+    if not latest_rows:
+        log("No indicator data. Aborting.")
+        return
+
+    latest = pd.DataFrame(latest_rows).reset_index(drop=True)
 
     available = [c for c in OUTPUT_COLS if c in latest.columns]
     latest    = latest[available].copy()
