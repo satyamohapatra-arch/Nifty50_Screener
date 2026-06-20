@@ -123,19 +123,33 @@ def download_nifty50(log=print):
         log("Data already up to date.")
         return pd.read_csv(MASTER_CSV, parse_dates=["Date"])
 
-    log(f"Fetching {len(NIFTY50_SYMBOLS)} stocks from {start_date} → {end_date}")
+    log(f"Fetching {len(NIFTY50_BOLS)} stocks from {start_date} → {end_date}")
     all_rows = []
 
     for sym in NIFTY50_SYMBOLS:
         try:
             df = yf.download(sym, start=start_date, end=fetch_end,
-                             interval="1d", auto_adjust=False, progress=False)
+                             interval="1d", auto_adjust=False,
+                             progress=False, group_by="ticker")
             if df.empty:
                 continue
+            # Flatten MultiIndex columns regardless of shape
             if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df.reset_index()[["Date","Open","High","Low","Close","Volume"]]
-            df["Stock"]  = sym
+                df.columns = ["_".join([c for c in col if c]).strip("_")
+                              for col in df.columns]
+                # rename ticker-prefixed columns e.g. RELIANCE_NS_Close -> Close
+                rename = {}
+                for c in df.columns:
+                    for base in ["Open","High","Low","Close","Volume","Adj Close"]:
+                        if c.endswith(base):
+                            rename[c] = base
+                df = df.rename(columns=rename)
+            df = df.reset_index()
+            # Ensure Date column exists
+            if "Date" not in df.columns and "index" in df.columns:
+                df = df.rename(columns={"index": "Date"})
+            df = df[["Date","Open","High","Low","Close","Volume"]].copy()
+            df["Stock"] = sym
             ticker_name  = sym.replace(".NS","")
             df["Sector"] = SECTOR_MAP.get(ticker_name, "Other")
             all_rows.append(df)
