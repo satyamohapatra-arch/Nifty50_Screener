@@ -24,7 +24,7 @@ import zoneinfo
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-SHEET_ID   = "YOUR_GOOGLE_SHEET_ID_HERE"          # ← replace
+SHEET_ID   = "1YsfDm4dFFM8aUfOS7uvIWDvphkSM39xOtlalgTUgkhM"          # ← replace
 MASTER_CSV = "nifty50_master.csv"
 SCOPES     = [
     "https://spreadsheets.google.com/feeds",
