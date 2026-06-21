@@ -303,9 +303,10 @@ def apply_filters(df, filters, logic):
 RISK_FREE_RATE = 0.065          # 6.5% annualised (approx Indian 91-day T-bill)
 TRADING_DAYS   = 252
 
-def compute_perf_metrics(price_series: pd.Series) -> dict:
+def compute_perf_metrics(price_series: pd.Series, rfr: float = RISK_FREE_RATE) -> dict:
     """
     Given a daily Close price series (sorted ascending), return a dict of metrics.
+    rfr: annualised risk-free rate (e.g. 0.065 for 6.5%)
     """
     prices = price_series.dropna()
     if len(prices) < 20:
@@ -319,13 +320,13 @@ def compute_perf_metrics(price_series: pd.Series) -> dict:
     cagr = (prices.iloc[-1] / prices.iloc[0]) ** (1 / max(n_years, 0.01)) - 1
 
     # ── Sharpe Ratio ──────────────────────────────────────────────────────────
-    excess        = daily_ret - RISK_FREE_RATE / TRADING_DAYS
+    excess        = daily_ret - rfr / TRADING_DAYS
     sharpe        = (excess.mean() / (excess.std() + 1e-10)) * np.sqrt(TRADING_DAYS)
 
     # ── Sortino Ratio ─────────────────────────────────────────────────────────
     downside      = daily_ret[daily_ret < 0]
     downside_std  = downside.std() * np.sqrt(TRADING_DAYS)
-    ann_excess    = daily_ret.mean() * TRADING_DAYS - RISK_FREE_RATE
+    ann_excess    = daily_ret.mean() * TRADING_DAYS - rfr
     sortino       = ann_excess / (downside_std + 1e-10)
 
     # ── Max Drawdown ──────────────────────────────────────────────────────────
@@ -849,11 +850,7 @@ with tab_perf:
     if pm_hist.empty or len(pm_hist) < 20:
         st.warning("Not enough data for the selected stock / period.")
     else:
-        # Override RFR with user input
-        global RISK_FREE_RATE
-        RISK_FREE_RATE = rfr
-
-        m = compute_perf_metrics(pm_hist["Close"].astype(float))
+        m = compute_perf_metrics(pm_hist["Close"].astype(float), rfr=rfr)
 
         if not m:
             st.warning("Could not compute metrics — insufficient data.")
