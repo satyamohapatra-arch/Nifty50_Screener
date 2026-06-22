@@ -337,12 +337,14 @@ def run_backtest(raw_df, strategy="absolute_longs"):
     strategy: 'absolute_longs' or 'bottom_fishing'
     Pool all stocks together, compute aggregate metrics.
     """
-    # group_keys=False + reset_index ensures "Stock" stays as a column
-    bt = (
-        raw_df.groupby("Stock", group_keys=False)
-              .apply(compute_bt_indicators)
-              .reset_index(drop=True)
-    )
+    # Loop per stock explicitly — avoids pandas 2.x groupby.apply()
+    # swallowing the "Stock" column as the index key
+    frames = []
+    for stock, grp in raw_df.groupby("Stock"):
+        result = compute_bt_indicators(grp.copy())
+        result["Stock"] = stock
+        frames.append(result)
+    bt = pd.concat(frames, ignore_index=True)
 
     if strategy == "absolute_longs":
         bt["Position"] = (
