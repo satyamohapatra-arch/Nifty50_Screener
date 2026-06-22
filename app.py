@@ -1554,7 +1554,7 @@ with tab_perf:
                 x=equity_df["Date"], y=equity_df["Strategy"],
                 name=f"{strat_label} Strategy",
                 line=dict(color=strat_color, width=2.5),
-                fill="tozeroy", fillcolor=f"{strat_color}11",
+                fill="tozeroy", fillcolor="rgba(0,138,88,0.07)" if "Longs" in strategy_choice else "rgba(194,65,65,0.07)",
             ))
             fig_eq.update_layout(
                 height=320, template="plotly_white",
