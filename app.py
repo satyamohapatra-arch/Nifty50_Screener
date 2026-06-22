@@ -886,9 +886,9 @@ def compute_indicators_full(df: pd.DataFrame) -> pd.DataFrame:
     ).map({True: "YES", False: "NO"})
 
     df["Bottom_Fishing"] = (
-        (df["EMA_10"] > df["EMA_20"]) &
-        (df["RSI_14"] > 50) &
-        (df["MACD_hist"] > 0) &
+        (df["EMA_10"] < df["EMA_20"]) &
+        (df["RSI_14"] < 50) &
+        (df["MACD_hist"] < 0) &
         (df["Supertrend_Signal"] == "SELL")
     ).map({True: "YES", False: "NO"})
 
