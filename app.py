@@ -848,20 +848,33 @@ def compute_indicators_full(df: pd.DataFrame) -> pd.DataFrame:
     atr = tr.ewm(span=14, adjust=False).mean()
     df["ATR_14"] = atr
 
-    # Supertrend
-    hl2        = (high + low) / 2
-    upper_band = (hl2 + 3 * atr).values
-    lower_band = (hl2 - 3 * atr).values
-    cl         = close.values
-    direction  = [1] * len(df)
-    for i in range(1, len(df)):
-        if np.isnan(atr.values[i]) or np.isnan(lower_band[i-1]) or np.isnan(upper_band[i-1]):
+    # Supertrend — scalar loop, fully nan-safe
+    hl2_arr = ((high + low) / 2).values
+    atr_arr = atr.values
+    cl      = close.values
+    n       = len(df)
+    ub = np.full(n, np.nan)
+    lb = np.full(n, np.nan)
+    direction = np.ones(n, dtype=int)
+    for i in range(n):
+        if np.isnan(atr_arr[i]) or np.isnan(hl2_arr[i]):
             continue
-        lower_band[i] = lower_band[i] if (lower_band[i] > lower_band[i-1] or cl[i-1] < lower_band[i-1]) else lower_band[i-1]
-        upper_band[i] = upper_band[i] if (upper_band[i] < upper_band[i-1] or cl[i-1] > upper_band[i-1]) else upper_band[i-1]
-        if   direction[i-1] == -1 and cl[i] > upper_band[i]: direction[i] = 1
-        elif direction[i-1] ==  1 and cl[i] < lower_band[i]: direction[i] = -1
-        else: direction[i] = direction[i-1]
+        raw_ub = hl2_arr[i] + 3.0 * atr_arr[i]
+        raw_lb = hl2_arr[i] - 3.0 * atr_arr[i]
+        if i == 0 or np.isnan(lb[i-1]) or np.isnan(ub[i-1]):
+            lb[i] = raw_lb
+            ub[i] = raw_ub
+        else:
+            lb[i] = raw_lb if (raw_lb > lb[i-1] or cl[i-1] < lb[i-1]) else lb[i-1]
+            ub[i] = raw_ub if (raw_ub < ub[i-1] or cl[i-1] > ub[i-1]) else ub[i-1]
+        if i == 0:
+            direction[i] = 1
+        elif direction[i-1] == -1 and cl[i] > ub[i]:
+            direction[i] = 1
+        elif direction[i-1] == 1 and cl[i] < lb[i]:
+            direction[i] = -1
+        else:
+            direction[i] = direction[i-1]
     df["Supertrend_Signal"] = ["BUY" if d == 1 else "SELL" for d in direction]
 
     # Strategy signals
