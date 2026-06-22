@@ -193,30 +193,35 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     data["ATR_14"] = atr
 
     # ── Supertrend (ATR multiplier = 3) ──────────────────────────────────────
-    hl2        = (high + low) / 2
-    upper_band = hl2 + 3 * atr
-    lower_band = hl2 - 3 * atr
+    hl2_arr = ((high + low) / 2).values
+    atr_arr = atr.values
+    cl      = close.values
+    n       = len(data)
+    ub = np.full(n, np.nan)
+    lb = np.full(n, np.nan)
+    direction = np.ones(n, dtype=int)
 
-    supertrend = [np.nan] * len(data)
-    direction  = [1] * len(data)          # 1 = BUY, -1 = SELL
-    cl = close.values
-    ub = upper_band.values
-    lb = lower_band.values
-
-    for i in range(1, len(data)):
-        if np.isnan(atr.values[i]):
+    for i in range(n):
+        if np.isnan(atr_arr[i]) or np.isnan(hl2_arr[i]):
             continue
-        lb[i] = lb[i] if (lb[i] > lb[i-1] or cl[i-1] < lb[i-1]) else lb[i-1]
-        ub[i] = ub[i] if (ub[i] < ub[i-1] or cl[i-1] > ub[i-1]) else ub[i-1]
-        if   direction[i-1] == -1 and cl[i] > ub[i]:
+        raw_ub = hl2_arr[i] + 3.0 * atr_arr[i]
+        raw_lb = hl2_arr[i] - 3.0 * atr_arr[i]
+        if i == 0 or np.isnan(lb[i-1]) or np.isnan(ub[i-1]):
+            lb[i] = raw_lb
+            ub[i] = raw_ub
+        else:
+            lb[i] = raw_lb if (raw_lb > lb[i-1] or cl[i-1] < lb[i-1]) else lb[i-1]
+            ub[i] = raw_ub if (raw_ub < ub[i-1] or cl[i-1] > ub[i-1]) else ub[i-1]
+        if i == 0:
             direction[i] = 1
-        elif direction[i-1] ==  1 and cl[i] < lb[i]:
+        elif direction[i-1] == -1 and cl[i] > ub[i]:
+            direction[i] = 1
+        elif direction[i-1] == 1 and cl[i] < lb[i]:
             direction[i] = -1
         else:
             direction[i] = direction[i-1]
-        supertrend[i] = lb[i] if direction[i] == 1 else ub[i]
 
-    data["Supertrend"]        = supertrend
+    data["Supertrend"]        = np.where(direction == 1, lb, ub)
     data["Supertrend_Signal"] = ["BUY" if d == 1 else "SELL" for d in direction]
 
     # ── Bollinger Bands (20, 2σ) ──────────────────────────────────────────────
