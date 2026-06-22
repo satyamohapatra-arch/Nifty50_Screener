@@ -28,7 +28,7 @@ import zoneinfo
 
 SHEET_ID    = "1YsfDm4dFFM8aUfOS7uvIWDvphkSM39xOtlalgTUgkhM"
 MASTER_CSV  = "nifty50_master.csv"
-TICKER_CSV  = "ind_nifty50list.csv"          # NSE official list
+TICKER_CSV  = "ind_nifty50list.csv"
 
 SCOPES = [
     "https://spreadsheets.google.com/feeds",
@@ -38,20 +38,11 @@ SCOPES = [
 # ── LOAD TICKERS FROM CSV ─────────────────────────────────────────────────────
 
 def load_tickers(csv_path: str = TICKER_CSV):
-    """
-    Reads ind_nifty50list.csv (columns: Company Name, Industry, Symbol, Series, ISIN Code).
-    Returns:
-      - NIFTY50_TICKERS  : list of bare symbols  e.g. ['RELIANCE', 'TCS', ...]
-      - NIFTY50_SYMBOLS  : list of .NS symbols   e.g. ['RELIANCE.NS', 'TCS.NS', ...]
-      - SECTOR_MAP       : dict {symbol: industry}
-    """
     df = pd.read_csv(csv_path)
-    # Normalise column names (strip whitespace)
     df.columns = df.columns.str.strip()
     df = df.dropna(subset=["Symbol"])
-
-    tickers   = df["Symbol"].str.strip().tolist()
-    symbols   = [t + ".NS" for t in tickers]
+    tickers    = df["Symbol"].str.strip().tolist()
+    symbols    = [t + ".NS" for t in tickers]
     sector_map = dict(zip(df["Symbol"].str.strip(), df["Industry"].str.strip()))
     return tickers, symbols, sector_map
 
@@ -62,18 +53,12 @@ OUTPUT_COLS = [
     "Date","Stock","Sector",
     "Open","High","Low","Close","Volume",
     "Prev_Close","Returns",
-    # Trend
     "EMA_10","EMA_20","SMA_50","Supertrend","Supertrend_Signal",
-    # Momentum
     "RSI_14","MACD_line","MACD_signal","MACD_hist",
     "Stoch_K","Stoch_D",
-    # Volatility
     "ATR_14","BB_Upper","BB_Middle","BB_Lower","BB_pctB",
-    # Volume
     "OBV","VWAP",
-    # Trend strength
     "ADX_14","DI_Plus","DI_Minus",
-    # Strategy flags
     "Absolute_Longs","Bottom_Fishing",
 ]
 
@@ -87,7 +72,8 @@ def get_gspread_client():
         with open("service_account.json") as f:
             info = json.load(f)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    return gspread.authorize(creds)
+    # gspread >= 5: gspread.authorize() removed — use Client directly
+    return gspread.Client(auth=creds)
 
 # ── DATE ──────────────────────────────────────────────────────────────────────
 
@@ -161,30 +147,23 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     low   = data["Low"].astype(float)
     vol   = data["Volume"].astype(float)
 
-    # ── EMA ──────────────────────────────────────────────────────────────────
     data["EMA_10"] = close.ewm(span=10, adjust=False).mean()
     data["EMA_20"] = close.ewm(span=20, adjust=False).mean()
-
-    # ── SMA ──────────────────────────────────────────────────────────────────
     data["SMA_50"] = close.rolling(50).mean()
 
-    # ── RSI ──────────────────────────────────────────────────────────────────
     delta    = close.diff()
     gain     = delta.clip(lower=0)
     loss     = (-delta).clip(lower=0)
     avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
-    rs       = avg_gain / (avg_loss + 1e-10)
-    data["RSI_14"] = 100 - (100 / (1 + rs))
+    data["RSI_14"] = 100 - (100 / (1 + avg_gain / (avg_loss + 1e-10)))
 
-    # ── MACD ─────────────────────────────────────────────────────────────────
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     data["MACD_line"]   = ema12 - ema26
     data["MACD_signal"] = data["MACD_line"].ewm(span=9, adjust=False).mean()
     data["MACD_hist"]   = data["MACD_line"] - data["MACD_signal"]
 
-    # ── ATR ──────────────────────────────────────────────────────────────────
     hl  = high - low
     hc  = (high - close.shift()).abs()
     lc  = (low  - close.shift()).abs()
@@ -192,7 +171,6 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     atr = tr.ewm(span=14, adjust=False).mean()
     data["ATR_14"] = atr
 
-    # ── Supertrend (ATR multiplier = 3) ──────────────────────────────────────
     hl2_arr = ((high + low) / 2).values
     atr_arr = atr.values
     cl      = close.values
@@ -224,7 +202,6 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     data["Supertrend"]        = np.where(direction == 1, lb, ub)
     data["Supertrend_Signal"] = ["BUY" if d == 1 else "SELL" for d in direction]
 
-    # ── Bollinger Bands (20, 2σ) ──────────────────────────────────────────────
     bb_mid = close.rolling(20).mean()
     bb_std = close.rolling(20).std()
     data["BB_Middle"] = bb_mid
@@ -232,13 +209,11 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     data["BB_Lower"]  = bb_mid - 2 * bb_std
     data["BB_pctB"]   = (close - data["BB_Lower"]) / (data["BB_Upper"] - data["BB_Lower"] + 1e-10)
 
-    # ── Stochastics (14,3) ────────────────────────────────────────────────────
-    low14      = low.rolling(14).min()
-    high14     = high.rolling(14).max()
+    low14  = low.rolling(14).min()
+    high14 = high.rolling(14).max()
     data["Stoch_K"] = 100 * (close - low14) / (high14 - low14 + 1e-10)
     data["Stoch_D"] = data["Stoch_K"].rolling(3).mean()
 
-    # ── OBV ──────────────────────────────────────────────────────────────────
     obv = [0.0]
     for i in range(1, len(data)):
         if   cl[i] > cl[i-1]: obv.append(obv[-1] + vol.values[i])
@@ -246,11 +221,9 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
         else:                  obv.append(obv[-1])
     data["OBV"] = obv
 
-    # ── VWAP (cumulative daily approx) ───────────────────────────────────────
     tp = (high + low + close) / 3
     data["VWAP"] = (tp * vol).cumsum() / (vol.cumsum() + 1e-10)
 
-    # ── ADX / DMI ─────────────────────────────────────────────────────────────
     up_move   = high.diff()
     down_move = (-low.diff())
     plus_dm   = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
@@ -264,11 +237,9 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
               (data["DI_Plus"] + data["DI_Minus"] + 1e-10)
     data["ADX_14"] = dx.ewm(span=14, adjust=False).mean()
 
-    # ── Returns ───────────────────────────────────────────────────────────────
     data["Prev_Close"] = close.shift(1)
     data["Returns"]    = close.pct_change() * 100
 
-    # ── Strategy Flags ────────────────────────────────────────────────────────
     data["Absolute_Longs"] = (
         (data["EMA_10"] > data["EMA_20"]) &
         (data["RSI_14"] > 50) &
@@ -297,27 +268,29 @@ def run(log=print):
     master["Date"] = pd.to_datetime(master["Date"])
 
     # 2. Compute indicators per stock
+    # Loop explicitly — avoids pandas 2.x groupby.apply() dropping the
+    # "Stock" column when it is used as the group key
     log("Computing indicators for all stocks...")
-    processed = (
-        master.groupby("Stock", group_keys=False)
-              .apply(compute_indicators)
-              .reset_index(drop=True)   # ensure Stock col is retained as regular col
-    )
+    frames = []
+    for stock, grp in master.groupby("Stock"):
+        result = compute_indicators(grp.copy())
+        result["Stock"] = stock          # guarantee column survives
+        frames.append(result)
+    processed = pd.concat(frames, ignore_index=True)
 
     # 3. Take latest row per stock
-    latest = (
-        processed.sort_values("Date")
-                 .groupby("Stock", group_keys=False)
-                 .apply(lambda x: x.iloc[-1])
-                 .reset_index(drop=True)
-    )
+    # Same fix: loop instead of groupby.apply()
+    latest_frames = []
+    for stock, grp in processed.groupby("Stock"):
+        latest_frames.append(grp.sort_values("Date").iloc[[-1]])
+    latest = pd.concat(latest_frames, ignore_index=True)
 
     # 4. Select and round output columns
-    available       = [c for c in OUTPUT_COLS if c in latest.columns]
-    latest          = latest[available].copy()
-    num_cols        = latest.select_dtypes(include=[np.number]).columns
+    available        = [c for c in OUTPUT_COLS if c in latest.columns]
+    latest           = latest[available].copy()
+    num_cols         = latest.select_dtypes(include=[np.number]).columns
     latest[num_cols] = latest[num_cols].round(2)
-    latest["Date"]  = pd.to_datetime(latest["Date"]).dt.strftime("%Y-%m-%d")
+    latest["Date"]   = pd.to_datetime(latest["Date"]).dt.strftime("%Y-%m-%d")
 
     log(f"Snapshot ready: {len(latest)} stocks")
 
