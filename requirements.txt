@@ -7,3 +7,4 @@ gspread-dataframe>=4.0.0
 google-auth>=2.29.0
 plotly>=5.22.0
 zoneinfo; python_version < "3.9"
+scipy
