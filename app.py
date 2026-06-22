@@ -1065,7 +1065,7 @@ def run_backtest(hist: pd.DataFrame, signal_col: str, rfr: float = 0.065):
     )
 
     # ── Probability Scorecard ─────────────────────────────────────────────────
-    import scipy.stats as stats  # lightweight, available in standard streamlit env
+    import scipy.stats as stats
 
     trade_rets = trades_df["Return %"].values
     if len(trade_rets) >= 5:
@@ -1073,9 +1073,7 @@ def run_backtest(hist: pd.DataFrame, signal_col: str, rfr: float = 0.065):
         std_r    = trade_rets.std()
         ci_low   = mean_r - 1.96 * std_r / np.sqrt(len(trade_rets))
         ci_high  = mean_r + 1.96 * std_r / np.sqrt(len(trade_rets))
-        # Reliability: penalise small samples
         reliability = min(100, int((n_trades / 30) * 100))
-        # Z-score: is win rate meaningfully above 50%?
         z_score  = (win_rate - 0.5) / (np.sqrt(0.25 / max(n_trades, 1)))
         p_value  = 1 - stats.norm.cdf(z_score)
         statistically_significant = p_value < 0.10
