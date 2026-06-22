@@ -855,7 +855,7 @@ def compute_indicators_full(df: pd.DataFrame) -> pd.DataFrame:
     cl         = close.values
     direction  = [1] * len(df)
     for i in range(1, len(df)):
-        if np.isnan(atr.values[i]):
+        if np.isnan(atr.values[i]) or np.isnan(lower_band[i-1]) or np.isnan(upper_band[i-1]):
             continue
         lower_band[i] = lower_band[i] if (lower_band[i] > lower_band[i-1] or cl[i-1] < lower_band[i-1]) else lower_band[i-1]
         upper_band[i] = upper_band[i] if (upper_band[i] < upper_band[i-1] or cl[i-1] > upper_band[i-1]) else upper_band[i-1]
