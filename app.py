@@ -1632,7 +1632,7 @@ with tab_perf:
             display_trades["Exit Date"]  = display_trades["Exit Date"].dt.strftime("%d %b %Y")
             st.dataframe(
                 display_trades.style
-                    .applymap(lambda v: "color:#008a58;font-weight:700" if v == "WIN"
+                    .map(lambda v: "color:#008a58;font-weight:700" if v == "WIN"
                               else ("color:#c24141;font-weight:700" if v == "LOSS" else ""),
                               subset=["Result"])
                     .format({"Return %": "{:+.2f}%", "Entry Price": "₹{:.2f}", "Exit Price": "₹{:.2f}"}),
