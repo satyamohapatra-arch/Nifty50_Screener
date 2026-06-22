@@ -809,58 +809,359 @@ with tab_backtest:
                 </div>""", unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# BACKTEST ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_indicators_full(df: pd.DataFrame) -> pd.DataFrame:
+    """Recompute all indicators on full history for backtesting."""
+    df    = df.sort_values("Date").copy().reset_index(drop=True)
+    close = df["Close"].astype(float)
+    high  = df["High"].astype(float)
+    low   = df["Low"].astype(float)
+
+    # EMA / SMA
+    df["EMA_10"] = close.ewm(span=10, adjust=False).mean()
+    df["EMA_20"] = close.ewm(span=20, adjust=False).mean()
+    df["SMA_50"] = close.rolling(50).mean()
+
+    # RSI
+    delta    = close.diff()
+    gain     = delta.clip(lower=0)
+    loss     = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+    rs       = avg_gain / (avg_loss + 1e-10)
+    df["RSI_14"] = 100 - (100 / (1 + rs))
+
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df["MACD_line"]   = ema12 - ema26
+    df["MACD_signal"] = df["MACD_line"].ewm(span=9, adjust=False).mean()
+    df["MACD_hist"]   = df["MACD_line"] - df["MACD_signal"]
+
+    # ATR
+    hl  = high - low
+    hc  = (high - close.shift()).abs()
+    lc  = (low  - close.shift()).abs()
+    tr  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    atr = tr.ewm(span=14, adjust=False).mean()
+    df["ATR_14"] = atr
+
+    # Supertrend
+    hl2        = (high + low) / 2
+    upper_band = (hl2 + 3 * atr).values
+    lower_band = (hl2 - 3 * atr).values
+    cl         = close.values
+    direction  = [1] * len(df)
+    for i in range(1, len(df)):
+        if np.isnan(atr.values[i]):
+            continue
+        lower_band[i] = lower_band[i] if (lower_band[i] > lower_band[i-1] or cl[i-1] < lower_band[i-1]) else lower_band[i-1]
+        upper_band[i] = upper_band[i] if (upper_band[i] < upper_band[i-1] or cl[i-1] > upper_band[i-1]) else upper_band[i-1]
+        if   direction[i-1] == -1 and cl[i] > upper_band[i]: direction[i] = 1
+        elif direction[i-1] ==  1 and cl[i] < lower_band[i]: direction[i] = -1
+        else: direction[i] = direction[i-1]
+    df["Supertrend_Signal"] = ["BUY" if d == 1 else "SELL" for d in direction]
+
+    # Strategy signals
+    df["Absolute_Longs"] = (
+        (df["EMA_10"] > df["EMA_20"]) &
+        (df["RSI_14"] > 50) &
+        (df["MACD_hist"] > 0) &
+        (df["Supertrend_Signal"] == "BUY")
+    ).map({True: "YES", False: "NO"})
+
+    df["Bottom_Fishing"] = (
+        (df["EMA_10"] > df["EMA_20"]) &
+        (df["RSI_14"] > 50) &
+        (df["MACD_hist"] > 0) &
+        (df["Supertrend_Signal"] == "SELL")
+    ).map({True: "YES", False: "NO"})
+
+    return df
+
+
+def run_backtest(hist: pd.DataFrame, signal_col: str, rfr: float = 0.065):
+    """
+    Simulate entry/exit trades on signal flips over the given history.
+    Entry : signal flips NO→YES  → buy at NEXT day Open
+    Exit  : signal flips YES→NO  → sell at NEXT day Open
+    Returns: (trades_df, equity_df, metrics_dict, scorecard_dict)
+    """
+    hist = hist.reset_index(drop=True)
+    sig  = hist[signal_col].values
+    op   = hist["Open"].astype(float).values
+    cl   = hist["Close"].astype(float).values
+    dt   = hist["Date"].values
+
+    trades    = []
+    in_trade  = False
+    entry_idx = None
+
+    for i in range(len(hist) - 1):
+        cur  = str(sig[i]).upper()
+        prev = str(sig[i-1]).upper() if i > 0 else "NO"
+
+        if not in_trade and cur == "YES" and prev == "NO":
+            # Entry: buy next day open
+            entry_idx   = i + 1
+            in_trade    = True
+
+        elif in_trade and cur == "NO" and prev == "YES":
+            # Exit: sell next day open
+            exit_idx    = i + 1
+            if exit_idx < len(hist):
+                entry_price = op[entry_idx]
+                exit_price  = op[exit_idx]
+                ret         = (exit_price - entry_price) / entry_price
+                hold_days   = exit_idx - entry_idx
+                trades.append({
+                    "Entry Date":   pd.Timestamp(dt[entry_idx]),
+                    "Exit Date":    pd.Timestamp(dt[exit_idx]),
+                    "Entry Price":  round(entry_price, 2),
+                    "Exit Price":   round(exit_price, 2),
+                    "Return %":     round(ret * 100, 2),
+                    "Hold Days":    hold_days,
+                    "Result":       "WIN" if ret > 0 else "LOSS",
+                })
+                in_trade = False
+                entry_idx = None
+
+    # Close open trade at last close price
+    if in_trade and entry_idx is not None:
+        ret       = (cl[-1] - op[entry_idx]) / op[entry_idx]
+        hold_days = len(hist) - 1 - entry_idx
+        trades.append({
+            "Entry Date":  pd.Timestamp(dt[entry_idx]),
+            "Exit Date":   pd.Timestamp(dt[-1]),
+            "Entry Price": round(op[entry_idx], 2),
+            "Exit Price":  round(cl[-1], 2),
+            "Return %":    round(ret * 100, 2),
+            "Hold Days":   hold_days,
+            "Result":      "WIN" if ret > 0 else ("OPEN" if ret == 0 else "LOSS"),
+        })
+
+    if not trades:
+        return pd.DataFrame(), pd.DataFrame(), {}, {}
+
+    trades_df = pd.DataFrame(trades)
+
+    # ── Strategy Equity Curve ─────────────────────────────────────────────────
+    # Build daily equity: 100 base, grows only when in a trade
+    equity    = np.ones(len(hist)) * 100.0
+    sig_arr   = hist[signal_col].values
+
+    in_trade_eq   = False
+    entry_eq_idx  = None
+    entry_eq_price= None
+
+    for i in range(len(hist)):
+        cur  = str(sig_arr[i]).upper()
+        prev = str(sig_arr[i-1]).upper() if i > 0 else "NO"
+
+        if not in_trade_eq and cur == "YES" and prev == "NO" and i+1 < len(hist):
+            in_trade_eq    = True
+            entry_eq_idx   = i + 1
+            entry_eq_price = op[i+1] if i+1 < len(hist) else cl[i]
+
+        if in_trade_eq and entry_eq_price:
+            curr_price  = cl[i]
+            daily_ret   = (curr_price - entry_eq_price) / entry_eq_price
+            equity[i]   = equity[entry_eq_idx - 1] * (1 + daily_ret) if entry_eq_idx and entry_eq_idx > 0 else 100 * (1 + daily_ret)
+
+        if in_trade_eq and cur == "NO" and prev == "YES":
+            in_trade_eq    = False
+            entry_eq_price = None
+
+    # Forward-fill flat periods (not in trade = equity stays same)
+    for i in range(1, len(equity)):
+        cur  = str(sig_arr[i]).upper()
+        prev = str(sig_arr[i-1]).upper() if i > 0 else "NO"
+        if cur == "NO" and not (prev == "YES" and cur == "NO"):
+            if not in_trade_eq:
+                equity[i] = equity[i-1]
+
+    # Buy & Hold equity
+    bh_prices  = cl.astype(float)
+    bh_equity  = bh_prices / bh_prices[0] * 100
+
+    equity_df = pd.DataFrame({
+        "Date":      hist["Date"],
+        "Strategy":  equity,
+        "BuyHold":   bh_equity,
+        "Close":     cl,
+        "Signal":    sig_arr,
+    })
+
+    # ── Trade Metrics ─────────────────────────────────────────────────────────
+    rets        = trades_df["Return %"].values / 100
+    wins        = trades_df[trades_df["Result"] == "WIN"]
+    losses      = trades_df[trades_df["Result"] == "LOSS"]
+    n_trades    = len(trades_df)
+    n_wins      = len(wins)
+    n_losses    = len(losses)
+    win_rate    = n_wins / max(n_trades, 1)
+    avg_win     = wins["Return %"].mean() if not wins.empty else 0
+    avg_loss    = losses["Return %"].mean() if not losses.empty else 0
+    gross_profit= wins["Return %"].sum() if not wins.empty else 0
+    gross_loss  = abs(losses["Return %"].sum()) if not losses.empty else 1e-10
+    pf          = gross_profit / (gross_loss + 1e-10)
+    expectancy  = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
+    avg_hold    = trades_df["Hold Days"].mean()
+    best_trade  = trades_df["Return %"].max()
+    worst_trade = trades_df["Return %"].min()
+
+    # Strategy CAGR & Drawdown from equity curve
+    strat_eq   = equity_df["Strategy"].values
+    n_days     = len(strat_eq)
+    n_years    = n_days / 252
+    strat_cagr = (strat_eq[-1] / strat_eq[0]) ** (1 / max(n_years, 0.01)) - 1
+    roll_max   = pd.Series(strat_eq).cummax()
+    strat_dd   = ((pd.Series(strat_eq) - roll_max) / roll_max).min()
+
+    # Sharpe / Sortino on trade returns
+    if len(rets) > 1:
+        excess    = rets - rfr / 252
+        sharpe    = (excess.mean() / (excess.std() + 1e-10)) * np.sqrt(252)
+        down_rets = rets[rets < 0]
+        down_std  = down_rets.std() * np.sqrt(252) if len(down_rets) > 1 else 1e-10
+        sortino   = (rets.mean() * 252 - rfr) / (down_std + 1e-10)
+        calmar    = strat_cagr / (abs(strat_dd) + 1e-10)
+    else:
+        sharpe = sortino = calmar = 0.0
+
+    metrics = dict(
+        n_trades    = n_trades,
+        n_wins      = n_wins,
+        n_losses    = n_losses,
+        win_rate    = win_rate,
+        avg_win     = avg_win,
+        avg_loss    = avg_loss,
+        profit_factor = pf,
+        expectancy  = expectancy,
+        avg_hold    = avg_hold,
+        best_trade  = best_trade,
+        worst_trade = worst_trade,
+        strat_cagr  = strat_cagr,
+        strat_dd    = strat_dd,
+        sharpe      = sharpe,
+        sortino     = sortino,
+        calmar      = calmar,
+        bh_return   = (bh_equity[-1] / 100) - 1,
+    )
+
+    # ── Probability Scorecard ─────────────────────────────────────────────────
+    import scipy.stats as stats  # lightweight, available in standard streamlit env
+
+    trade_rets = trades_df["Return %"].values
+    if len(trade_rets) >= 5:
+        mean_r   = trade_rets.mean()
+        std_r    = trade_rets.std()
+        ci_low   = mean_r - 1.96 * std_r / np.sqrt(len(trade_rets))
+        ci_high  = mean_r + 1.96 * std_r / np.sqrt(len(trade_rets))
+        # Reliability: penalise small samples
+        reliability = min(100, int((n_trades / 30) * 100))
+        # Z-score: is win rate meaningfully above 50%?
+        z_score  = (win_rate - 0.5) / (np.sqrt(0.25 / max(n_trades, 1)))
+        p_value  = 1 - stats.norm.cdf(z_score)
+        statistically_significant = p_value < 0.10
+    else:
+        ci_low = ci_high = mean_r = std_r = 0.0
+        reliability = 0
+        p_value = 1.0
+        statistically_significant = False
+
+    scorecard = dict(
+        hist_win_prob   = win_rate * 100,
+        expectancy_per_trade = expectancy,
+        ci_low          = ci_low,
+        ci_high         = ci_high,
+        reliability     = reliability,
+        n_trades        = n_trades,
+        p_value         = p_value,
+        significant     = statistically_significant,
+        mean_trade_ret  = mean_r if n_trades >= 5 else 0,
+        std_trade_ret   = std_r  if n_trades >= 5 else 0,
+    )
+
+    return trades_df, equity_df, metrics, scorecard
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — PERFORMANCE METRICS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with tab_perf:
     st.markdown("## Performance Metrics")
-    st.caption("Risk-adjusted return analysis computed from historical OHLCV data")
 
     if not os.path.exists("nifty50_master.csv"):
-        st.warning("Historical data not found. Run the screener pipeline first to generate `nifty50_master.csv`.")
+        st.warning("Historical data not found. Run the screener pipeline first.")
         st.stop()
 
     master_full = pd.read_csv("nifty50_master.csv", parse_dates=["Date"])
 
-    # Stock selector
-    pm_col1, pm_col2, pm_col3 = st.columns([3, 2, 3])
-    with pm_col1:
-        pm_stock_options = sorted(master_full["Stock"].str.replace(".NS","").unique().tolist())
-        pm_selected      = st.selectbox("Select Stock", pm_stock_options, key="pm_stock")
-    with pm_col2:
-        period_map = {
-            "1 Year":  252,
-            "2 Years": 504,
-            "3 Years": 756,
-            "5 Years": 1260,
-            "All":     99999,
-        }
-        pm_period = st.selectbox("Period", list(period_map.keys()), index=2, key="pm_period")
-    with pm_col3:
+    # ── Mode toggle ───────────────────────────────────────────────────────────
+    mode_col, _, rfr_col = st.columns([3, 1, 2])
+    with mode_col:
+        perf_mode = st.radio(
+            "Mode", ["📊 Price Analysis", "🔬 Strategy Backtest"],
+            horizontal=True, label_visibility="collapsed",
+        )
+    with rfr_col:
         rfr_pct = st.number_input(
             "Risk-Free Rate (%)", value=6.5, min_value=0.0, max_value=20.0, step=0.1,
-            help="Annualised risk-free rate (e.g. 91-day T-bill yield)",
+            help="Annualised risk-free rate (91-day T-bill)",
         )
         rfr = rfr_pct / 100
 
+    st.divider()
+
+    # ── Stock selector ────────────────────────────────────────────────────────
+    sel_col1, sel_col2 = st.columns([3, 3])
+    with sel_col1:
+        pm_stock_options = sorted(master_full["Stock"].str.replace(".NS","").unique().tolist())
+        pm_selected      = st.selectbox("Select Stock", pm_stock_options, key="pm_stock")
+    with sel_col2:
+        if perf_mode == "📊 Price Analysis":
+            period_map = {"1 Year":252,"2 Years":504,"3 Years":756,"5 Years":1260,"All":99999}
+            pm_period  = st.selectbox("Period", list(period_map.keys()), index=2, key="pm_period")
+        else:
+            strategy_choice = st.selectbox(
+                "Strategy", ["🚀 Absolute Longs", "🎣 Bottom-Fishing"], key="bt_strategy"
+            )
+            signal_col = "Absolute_Longs" if "Longs" in strategy_choice else "Bottom_Fishing"
+
     pm_sym  = pm_selected + ".NS"
     pm_hist = master_full[master_full["Stock"].isin([pm_sym, pm_selected])].sort_values("Date")
-    pm_hist = pm_hist.tail(period_map[pm_period])
 
-    if pm_hist.empty or len(pm_hist) < 20:
-        st.warning("Not enough data for the selected stock / period.")
+    # Always use last 1 year for backtest
+    if perf_mode == "🔬 Strategy Backtest":
+        pm_hist = pm_hist.tail(252)
     else:
-        m = compute_perf_metrics(pm_hist["Close"].astype(float), rfr=rfr)
+        pm_hist = pm_hist.tail(period_map[pm_period])
 
+    if pm_hist.empty or len(pm_hist) < 30:
+        st.warning("Not enough data for the selected stock / period.")
+        st.stop()
+
+    company_name = COMPANY_MAP.get(pm_selected, pm_selected)
+    sector_name  = SECTOR_MAP.get(pm_selected, "—")
+    start_date_s = pm_hist["Date"].iloc[0].strftime("%d %b %Y")
+    end_date_s   = pm_hist["Date"].iloc[-1].strftime("%d %b %Y")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # MODE A — PRICE ANALYSIS (original)
+    # ═══════════════════════════════════════════════════════════════════════════
+    if perf_mode == "📊 Price Analysis":
+        m = compute_perf_metrics(pm_hist["Close"].astype(float), rfr=rfr)
         if not m:
             st.warning("Could not compute metrics — insufficient data.")
-        else:
-            company_name = COMPANY_MAP.get(pm_selected, pm_selected)
-            sector_name  = SECTOR_MAP.get(pm_selected, "—")
-            start_price  = pm_hist["Close"].iloc[0]
-            end_price    = pm_hist["Close"].iloc[-1]
-            start_date_s = pm_hist["Date"].iloc[0].strftime("%d %b %Y")
-            end_date_s   = pm_hist["Date"].iloc[-1].strftime("%d %b %Y")
+            st.stop()
+
+        start_price = pm_hist["Close"].iloc[0]
+        end_price   = pm_hist["Close"].iloc[-1]
+        if True:  # keep indentation consistent
 
             st.markdown(f"""
             <div style="background:#fff;border:1px solid #e0e0e0;border-radius:12px;padding:16px 20px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center">
@@ -1074,6 +1375,264 @@ with tab_perf:
                     {"Metric": "Period (years)",    "Value": f"{m['n_years']:.2f}"},
                 ])
                 st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # MODE B — STRATEGY BACKTEST
+    # ═══════════════════════════════════════════════════════════════════════════
+    elif perf_mode == "🔬 Strategy Backtest":
+        with st.spinner("Computing indicators & running backtest..."):
+            bt_hist = compute_indicators_full(pm_hist.copy())
+            trades_df, equity_df, metrics, scorecard = run_backtest(bt_hist, signal_col, rfr=rfr)
+
+        strat_label = strategy_choice
+        strat_color = "#008a58" if "Longs" in strategy_choice else "#c24141"
+
+        # ── Header ────────────────────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="background:#fff;border:1px solid #e0e0e0;border-radius:12px;
+                    padding:16px 20px;margin-bottom:20px;
+                    display:flex;justify-content:space-between;align-items:center">
+            <div>
+                <span style="font-size:1.4rem;font-weight:700">{pm_selected}</span>
+                <span style="color:#888;font-size:13px;margin-left:10px">{company_name}</span>
+                <span style="background:#e8f0fb;color:#2e75b6;border-radius:6px;
+                             padding:2px 8px;font-size:11px;font-weight:700;margin-left:8px">{sector_name}</span>
+                <span style="background:{strat_color}22;color:{strat_color};border-radius:6px;
+                             padding:2px 8px;font-size:11px;font-weight:700;margin-left:8px">{strat_label}</span>
+            </div>
+            <div style="text-align:right;font-size:12px;color:#888">
+                Last 1 Year · {start_date_s} → {end_date_s}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if trades_df.empty:
+            st.warning("No trades were triggered for this strategy on this stock in the last 1 year. Try a different stock or strategy.")
+        else:
+            # ── KPI Row ───────────────────────────────────────────────────────
+            k1,k2,k3,k4,k5,k6 = st.columns(6, gap="small")
+            k1.metric("Total Trades",   metrics["n_trades"])
+            k2.metric("Win Rate",       f"{metrics['win_rate']*100:.1f}%")
+            k3.metric("Profit Factor",  f"{metrics['profit_factor']:.2f}")
+            k4.metric("Avg Win",        f"+{metrics['avg_win']:.2f}%")
+            k5.metric("Avg Loss",       f"{metrics['avg_loss']:.2f}%")
+            k6.metric("Expectancy",     f"{metrics['expectancy']:+.2f}%")
+
+            st.divider()
+
+            # ── Strategy vs B&H Metrics ───────────────────────────────────────
+            st.markdown("#### Strategy vs Buy & Hold")
+            mc1,mc2,mc3,mc4 = st.columns(4, gap="small")
+
+            with mc1:
+                c = "perf-good" if metrics["strat_cagr"] > metrics["bh_return"] else "perf-neu"
+                st.markdown(perf_card_html(
+                    "Strategy CAGR",
+                    f"{metrics['strat_cagr']*100:+.2f}%",
+                    f"B&H: {metrics['bh_return']*100:+.2f}%", c
+                ), unsafe_allow_html=True)
+            with mc2:
+                c = "perf-good" if metrics["strat_dd"] > metrics.get("bh_dd", metrics["strat_dd"]) else "perf-neu"
+                st.markdown(perf_card_html(
+                    "Max Drawdown",
+                    f"{metrics['strat_dd']*100:.2f}%",
+                    "Strategy worst peak→trough", "perf-bad" if metrics["strat_dd"] < -0.15 else "perf-neu"
+                ), unsafe_allow_html=True)
+            with mc3:
+                c = "perf-good" if metrics["sharpe"] > 1 else ("perf-neu" if metrics["sharpe"] > 0 else "perf-bad")
+                st.markdown(perf_card_html(
+                    "Sharpe Ratio", f"{metrics['sharpe']:.2f}",
+                    "On trade returns", c
+                ), unsafe_allow_html=True)
+            with mc4:
+                c = "perf-good" if metrics["sortino"] > 1.5 else ("perf-neu" if metrics["sortino"] > 0 else "perf-bad")
+                st.markdown(perf_card_html(
+                    "Sortino Ratio", f"{metrics['sortino']:.2f}",
+                    "Downside risk only", c
+                ), unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            mc5,mc6,mc7,mc8 = st.columns(4, gap="small")
+            with mc5:
+                st.markdown(perf_card_html(
+                    "Best Trade",  f"+{metrics['best_trade']:.2f}%",
+                    "Single trade max gain", "perf-good"
+                ), unsafe_allow_html=True)
+            with mc6:
+                st.markdown(perf_card_html(
+                    "Worst Trade", f"{metrics['worst_trade']:.2f}%",
+                    "Single trade max loss", "perf-bad"
+                ), unsafe_allow_html=True)
+            with mc7:
+                st.markdown(perf_card_html(
+                    "Avg Hold", f"{metrics['avg_hold']:.1f} days",
+                    "Per trade", "perf-neu"
+                ), unsafe_allow_html=True)
+            with mc8:
+                c = "perf-good" if metrics["calmar"] > 0.5 else ("perf-neu" if metrics["calmar"] > 0 else "perf-bad")
+                st.markdown(perf_card_html(
+                    "Calmar Ratio", f"{metrics['calmar']:.2f}",
+                    "CAGR ÷ Max Drawdown", c
+                ), unsafe_allow_html=True)
+
+            st.divider()
+
+            # ── Probability Scorecard ─────────────────────────────────────────
+            st.markdown("#### 🎯 Probability Scorecard")
+            st.caption("Evidence-based probability from historical trade behaviour — not a prediction of future results.")
+
+            sc = scorecard
+            sig_text  = "✅ Statistically significant" if sc["significant"] else "⚠️ Not yet statistically significant"
+            sig_color = "#008a58" if sc["significant"] else "#e07c00"
+            rel_color = "#008a58" if sc["reliability"] >= 70 else ("#e07c00" if sc["reliability"] >= 40 else "#c24141")
+
+            sc1,sc2,sc3,sc4 = st.columns(4, gap="small")
+            with sc1:
+                c = "perf-good" if sc["hist_win_prob"] > 55 else ("perf-neu" if sc["hist_win_prob"] >= 45 else "perf-bad")
+                st.markdown(perf_card_html(
+                    "Win Probability",
+                    f"{sc['hist_win_prob']:.1f}%",
+                    "% of past trades profitable", c
+                ), unsafe_allow_html=True)
+            with sc2:
+                c = "perf-good" if sc["expectancy_per_trade"] > 0 else "perf-bad"
+                st.markdown(perf_card_html(
+                    "Expectancy / Trade",
+                    f"{sc['expectancy_per_trade']:+.2f}%",
+                    "Expected return per trade", c
+                ), unsafe_allow_html=True)
+            with sc3:
+                st.markdown(perf_card_html(
+                    "95% CI Next Trade",
+                    f"{sc['ci_low']:+.1f}% to {sc['ci_high']:+.1f}%",
+                    "Likely range for next trade return", "perf-neu"
+                ), unsafe_allow_html=True)
+            with sc4:
+                st.markdown(perf_card_html(
+                    "Signal Reliability",
+                    f"{sc['reliability']}%",
+                    f"Based on {sc['n_trades']} trades (30 = 100%)",
+                    "perf-good" if sc["reliability"] >= 70 else ("perf-neu" if sc["reliability"] >= 40 else "perf-bad")
+                ), unsafe_allow_html=True)
+
+            st.markdown(f"""
+            <div style="background:#f8f9fa;border:1px solid #e0e0e0;border-radius:10px;
+                        padding:12px 16px;margin-top:8px;font-size:12px;color:#555">
+                <strong style="color:{sig_color}">{sig_text}</strong>
+                &nbsp;·&nbsp; p-value: {sc['p_value']:.3f}
+                &nbsp;·&nbsp; {sc['n_trades']} trades in last 1 year
+                &nbsp;·&nbsp; Mean trade return: {sc['mean_trade_ret']:+.2f}% ± {sc['std_trade_ret']:.2f}%
+                <br><span style="color:#aaa;font-size:11px;margin-top:4px;display:block">
+                ⚠ Past performance does not guarantee future results. More trades = more reliable probability estimate.
+                Minimum 30 trades recommended for statistical confidence.</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.divider()
+
+            # ── Equity Curve ──────────────────────────────────────────────────
+            st.markdown("#### Equity Curve — Strategy vs Buy & Hold")
+            fig_eq = go.Figure()
+            fig_eq.add_trace(go.Scatter(
+                x=equity_df["Date"], y=equity_df["BuyHold"],
+                name="Buy & Hold",
+                line=dict(color="#888888", width=1.5, dash="dot"),
+            ))
+            fig_eq.add_trace(go.Scatter(
+                x=equity_df["Date"], y=equity_df["Strategy"],
+                name=f"{strat_label} Strategy",
+                line=dict(color=strat_color, width=2.5),
+                fill="tozeroy", fillcolor=f"{strat_color}11",
+            ))
+            fig_eq.update_layout(
+                height=320, template="plotly_white",
+                margin=dict(l=0,r=0,t=10,b=0),
+                yaxis_title="Value (base 100)",
+                legend=dict(orientation="h", y=1.08),
+                font=dict(size=11),
+            )
+            st.plotly_chart(fig_eq, use_container_width=True)
+
+            # ── Price chart with entry/exit markers ───────────────────────────
+            st.markdown("#### Price Chart — Entry 🟢 / Exit 🔴 Markers")
+            fig_price = go.Figure()
+            fig_price.add_trace(go.Scatter(
+                x=equity_df["Date"], y=equity_df["Close"],
+                name="Close", line=dict(color="#2e75b6", width=1.5),
+            ))
+            entries = trades_df[trades_df["Entry Date"].notna()]
+            exits   = trades_df[trades_df["Exit Date"].notna()]
+
+            # Map entry/exit dates to close prices for marker placement
+            date_price = dict(zip(
+                pd.to_datetime(equity_df["Date"]).dt.date,
+                equity_df["Close"].values
+            ))
+            entry_prices = [date_price.get(d.date(), None) for d in entries["Entry Date"]]
+            exit_prices  = [date_price.get(d.date(), None) for d in exits["Exit Date"]]
+
+            fig_price.add_trace(go.Scatter(
+                x=entries["Entry Date"], y=entry_prices,
+                mode="markers", name="Entry",
+                marker=dict(symbol="triangle-up", size=12, color="#008a58"),
+            ))
+            fig_price.add_trace(go.Scatter(
+                x=exits["Exit Date"], y=exit_prices,
+                mode="markers", name="Exit",
+                marker=dict(symbol="triangle-down", size=12, color="#c24141"),
+            ))
+            fig_price.update_layout(
+                height=300, template="plotly_white",
+                margin=dict(l=0,r=0,t=10,b=0),
+                legend=dict(orientation="h", y=1.08),
+                font=dict(size=11),
+            )
+            st.plotly_chart(fig_price, use_container_width=True)
+
+            # ── Return Distribution ───────────────────────────────────────────
+            st.markdown("#### Trade Return Distribution")
+            fig_dist = go.Figure()
+            fig_dist.add_trace(go.Histogram(
+                x=trades_df["Return %"],
+                nbinsx=20,
+                marker_color=[strat_color if r > 0 else "#c24141" for r in trades_df["Return %"]],
+                name="Trade Returns",
+            ))
+            fig_dist.add_vline(x=0, line_dash="dash", line_color="#888", line_width=1)
+            fig_dist.add_vline(
+                x=scorecard["mean_trade_ret"], line_dash="dot",
+                line_color=strat_color, line_width=2,
+                annotation_text=f"Mean: {scorecard['mean_trade_ret']:+.2f}%",
+                annotation_position="top right",
+            )
+            fig_dist.update_layout(
+                height=240, template="plotly_white",
+                margin=dict(l=0,r=0,t=20,b=0),
+                xaxis_title="Return %", yaxis_title="# Trades",
+                showlegend=False, font=dict(size=11),
+            )
+            st.plotly_chart(fig_dist, use_container_width=True)
+
+            # ── Trade Log ────────────────────────────────────────────────────
+            st.markdown("#### Trade Log")
+            display_trades = trades_df.copy()
+            display_trades["Entry Date"] = display_trades["Entry Date"].dt.strftime("%d %b %Y")
+            display_trades["Exit Date"]  = display_trades["Exit Date"].dt.strftime("%d %b %Y")
+            st.dataframe(
+                display_trades.style
+                    .applymap(lambda v: "color:#008a58;font-weight:700" if v == "WIN"
+                              else ("color:#c24141;font-weight:700" if v == "LOSS" else ""),
+                              subset=["Result"])
+                    .format({"Return %": "{:+.2f}%", "Entry Price": "₹{:.2f}", "Exit Price": "₹{:.2f}"}),
+                use_container_width=True, hide_index=True,
+            )
+            st.download_button(
+                "⬇ Download Trade Log",
+                trades_df.to_csv(index=False),
+                file_name=f"{pm_selected}_{strategy_choice.replace(' ','_')}_trades.csv",
+                mime="text/csv",
+            )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — SECTOR HEATMAP
