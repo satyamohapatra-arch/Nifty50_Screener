@@ -299,6 +299,11 @@ def compute_bt_indicators(data):
     avg_loss = (-delta).clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     data["RSI_14"] = 100 - (100 / (1 + avg_gain / (avg_loss + 1e-10)))
 
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    data["MACD_hist"] = macd_line - macd_line.ewm(span=9, adjust=False).mean()
+
     # Supertrend (ATR multiplier=3, span=7 — matching the Colab notebook)
     hl  = high - low
     hcp = (high - close.shift()).abs()
@@ -326,22 +331,33 @@ def compute_bt_indicators(data):
     data["Daily_Return"] = close.pct_change()
     return data
 
-def run_backtest(raw_df):
+def run_backtest(raw_df, strategy="absolute_longs"):
     """
-    Exact same logic as the notebook:
-      Position = EMA10 > EMA20 & RSI > 50 & Supertrend BUY, shifted 1 day.
-      Pool all stocks together, compute aggregate metrics.
+    Exact same logic as the notebook.
+    strategy: 'absolute_longs' or 'bottom_fishing'
+    Pool all stocks together, compute aggregate metrics.
     """
+    # group_keys=False + reset_index ensures "Stock" stays as a column
     bt = (
         raw_df.groupby("Stock", group_keys=False)
               .apply(compute_bt_indicators)
+              .reset_index(drop=True)
     )
 
-    bt["Position"] = (
-        (bt["EMA_10"] > bt["EMA_20"]) &
-        (bt["RSI_14"] > 50) &
-        (bt["Supertrend_Signal"] == "BUY")
-    ).astype(int)
+    if strategy == "absolute_longs":
+        bt["Position"] = (
+            (bt["EMA_10"] > bt["EMA_20"]) &
+            (bt["RSI_14"] > 50) &
+            (bt["MACD_hist"] > 0) &
+            (bt["Supertrend_Signal"] == "BUY")
+        ).astype(int)
+    else:  # bottom_fishing
+        bt["Position"] = (
+            (bt["EMA_10"] < bt["EMA_20"]) &
+            (bt["RSI_14"] < 50) &
+            (bt["MACD_hist"] < 0) &
+            (bt["Supertrend_Signal"] == "SELL")
+        ).astype(int)
 
     # Avoid look-ahead bias — same as notebook
     bt["Position"] = bt.groupby("Stock")["Position"].shift(1)
@@ -815,106 +831,154 @@ with tab_heatmap:
 # ── TAB 4: PERFORMANCE ────────────────────────────────────────────────────────
 with tab_perf:
     st.markdown("## Strategy Performance")
-    st.caption("Absolute Longs strategy · Last 1 year · All Nifty 50 stocks pooled · EMA10 > EMA20, RSI > 50, Supertrend BUY")
+    st.caption("Last 1 year · All Nifty 50 stocks pooled · Position shifted 1 day to avoid look-ahead bias")
 
     run_bt = st.button("▶ Run Backtest", type="primary")
 
+    def _color(label, val):
+        if "Drawdown" in label: return "negative" if val < 0 else "positive"
+        if label in ("CAGR %","Sharpe Ratio","Sortino Ratio",
+                     "Calmar Ratio","Win Rate %","Profit Factor",
+                     "Benchmark CAGR %"):
+            return "positive" if val > 0 else "negative"
+        return ""
+
+    def render_strategy_metrics(name, color, caption, metrics, eq_curve, bench_curve, drawdown_series):
+        st.markdown(f"""
+        <div style="border-left:4px solid {color};padding-left:14px;margin-bottom:8px">
+          <div style="font-size:1.1rem;font-weight:700;color:{color}">{name}</div>
+          <div style="font-size:12px;color:#888">{caption}</div>
+        </div>""", unsafe_allow_html=True)
+
+        labels = list(metrics.keys())
+        values = list(metrics.values())
+
+        row1 = st.columns(4, gap="small")
+        row2 = st.columns(4, gap="small")
+        for i, col in enumerate(row1):
+            with col:
+                lbl = labels[i]; val = values[i]
+                cls = _color(lbl, val)
+                st.markdown(f"""
+                <div class="metric-card">
+                  <div class="mc-label">{lbl}</div>
+                  <div class="mc-value {cls}">{val:+.2f}</div>
+                </div>""", unsafe_allow_html=True)
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+        for i, col in enumerate(row2):
+            with col:
+                lbl = labels[i + 4]; val = values[i + 4]
+                cls = _color(lbl, val)
+                st.markdown(f"""
+                <div class="metric-card">
+                  <div class="mc-label">{lbl}</div>
+                  <div class="mc-value {cls}">{val:+.2f}</div>
+                </div>""", unsafe_allow_html=True)
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+        # Equity curve
+        eq_df = pd.DataFrame({
+            "Date":      eq_curve.index,
+            "Strategy":  eq_curve.values,
+            "Benchmark": bench_curve.reindex(eq_curve.index).values,
+        }).dropna()
+        fig_eq = go.Figure()
+        fig_eq.add_trace(go.Scatter(
+            x=eq_df["Date"], y=eq_df["Strategy"],
+            name=name, line=dict(color=color, width=2)))
+        fig_eq.add_trace(go.Scatter(
+            x=eq_df["Date"], y=eq_df["Benchmark"],
+            name="Benchmark (Buy & Hold)", line=dict(color="#888888", width=1.5, dash="dot")))
+        fig_eq.update_layout(
+            title="Equity Curve — ₹1,00,000 Starting Capital",
+            height=340, template="plotly_white",
+            margin=dict(l=0,r=0,t=40,b=0),
+            legend=dict(orientation="h", y=1.08),
+            yaxis_tickprefix="₹", font=dict(size=11))
+        st.plotly_chart(fig_eq, use_container_width=True)
+
+        # Drawdown
+        dd_df = drawdown_series.reset_index()
+        dd_df.columns = ["Index","Drawdown"]
+        fig_dd = go.Figure()
+        fig_dd.add_trace(go.Scatter(
+            x=dd_df["Index"], y=dd_df["Drawdown"] * 100,
+            fill="tozeroy", fillcolor="rgba(194,65,65,0.12)",
+            line=dict(color="#c24141", width=1.5), name="Drawdown %"))
+        fig_dd.update_layout(
+            title="Drawdown %", height=200, template="plotly_white",
+            margin=dict(l=0,r=0,t=40,b=0),
+            yaxis_ticksuffix="%", font=dict(size=11), showlegend=False)
+        st.plotly_chart(fig_dd, use_container_width=True)
+
     if run_bt:
-        st.cache_data.clear()   # force fresh fetch if user re-runs
+        st.cache_data.clear()
         with st.spinner("Fetching 1 year of data for 50 stocks..."):
             raw_df = fetch_backtest_data()
 
         if raw_df.empty:
             st.error("Could not fetch price data. Check your internet connection.")
         else:
-            with st.spinner("Running backtest..."):
-                metrics, eq_curve, bench_curve, drawdown_series = run_backtest(raw_df)
+            with st.spinner("Running backtests for both strategies..."):
+                al_metrics, al_eq, al_bench, al_dd = run_backtest(raw_df, strategy="absolute_longs")
+                bf_metrics, bf_eq, bf_bench, bf_dd = run_backtest(raw_df, strategy="bottom_fishing")
 
             st.divider()
 
-            # ── 8 Metric Cards ──────────────────────────────────────────────
-            labels = list(metrics.keys())
-            values = list(metrics.values())
+            # ── Side-by-side strategy tabs ────────────────────────────────────
+            strat_tab_al, strat_tab_bf, strat_tab_cmp = st.tabs([
+                "🚀 Absolute Longs", "🎣 Bottom-Fishing", "⚖ Comparison"
+            ])
 
-            row1 = st.columns(4, gap="small")
-            row2 = st.columns(4, gap="small")
+            with strat_tab_al:
+                render_strategy_metrics(
+                    name    = "🚀 Absolute Longs",
+                    color   = "#008a58",
+                    caption = "EMA10 > EMA20 · RSI > 50 · Supertrend BUY",
+                    metrics = al_metrics,
+                    eq_curve      = al_eq,
+                    bench_curve   = al_bench,
+                    drawdown_series = al_dd,
+                )
 
-            def _color(label, val):
-                if "Drawdown" in label: return "negative" if val < 0 else "positive"
-                if label in ("CAGR %","Sharpe Ratio","Sortino Ratio",
-                             "Calmar Ratio","Win Rate %","Profit Factor",
-                             "Benchmark CAGR %"):
-                    return "positive" if val > 0 else "negative"
-                return ""
+            with strat_tab_bf:
+                render_strategy_metrics(
+                    name    = "🎣 Bottom-Fishing",
+                    color   = "#c24141",
+                    caption = "EMA10 < EMA20 · RSI < 50 · Supertrend SELL",
+                    metrics = bf_metrics,
+                    eq_curve      = bf_eq,
+                    bench_curve   = bf_bench,
+                    drawdown_series = bf_dd,
+                )
 
-            for i, col in enumerate(row1):
-                with col:
-                    lbl = labels[i]; val = values[i]
-                    cls = _color(lbl, val)
-                    st.markdown(f"""
-                    <div class="metric-card">
-                      <div class="mc-label">{lbl}</div>
-                      <div class="mc-value {cls}">{val:+.2f}</div>
-                    </div>""", unsafe_allow_html=True)
+            with strat_tab_cmp:
+                st.markdown("#### Head-to-Head Comparison")
+                cmp_df = pd.DataFrame({
+                    "Metric":         list(al_metrics.keys()),
+                    "Absolute Longs": [f"{v:+.2f}" for v in al_metrics.values()],
+                    "Bottom-Fishing": [f"{v:+.2f}" for v in bf_metrics.values()],
+                })
+                st.dataframe(cmp_df, use_container_width=True, hide_index=True)
 
-            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+                # Overlay equity curves
+                al_df = pd.DataFrame({"Date": al_eq.index, "Absolute Longs": al_eq.values})
+                bf_df = pd.DataFrame({"Date": bf_eq.index, "Bottom-Fishing": bf_eq.values})
+                bk_df = pd.DataFrame({"Date": al_bench.index, "Benchmark": al_bench.values})
 
-            for i, col in enumerate(row2):
-                with col:
-                    lbl = labels[i + 4]; val = values[i + 4]
-                    cls = _color(lbl, val)
-                    st.markdown(f"""
-                    <div class="metric-card">
-                      <div class="mc-label">{lbl}</div>
-                      <div class="mc-value {cls}">{val:+.2f}</div>
-                    </div>""", unsafe_allow_html=True)
-
-            st.divider()
-
-            # ── Equity Curve Chart ───────────────────────────────────────────
-            eq_df = pd.DataFrame({
-                "Date":      eq_curve.index,
-                "Strategy":  eq_curve.values,
-                "Benchmark": bench_curve.reindex(eq_curve.index).values,
-            }).dropna()
-
-            fig_eq = go.Figure()
-            fig_eq.add_trace(go.Scatter(
-                x=eq_df["Date"], y=eq_df["Strategy"],
-                name="Absolute Longs", line=dict(color="#2e75b6", width=2)))
-            fig_eq.add_trace(go.Scatter(
-                x=eq_df["Date"], y=eq_df["Benchmark"],
-                name="Benchmark (Buy & Hold)", line=dict(color="#888888", width=1.5, dash="dot")))
-            fig_eq.update_layout(
-                title="Equity Curve — ₹1,00,000 Starting Capital",
-                height=380, template="plotly_white",
-                margin=dict(l=0,r=0,t=40,b=0),
-                legend=dict(orientation="h", y=1.08),
-                yaxis_tickprefix="₹", font=dict(size=11))
-            st.plotly_chart(fig_eq, use_container_width=True)
-
-            # ── Drawdown Chart ───────────────────────────────────────────────
-            dd_df = drawdown_series.reset_index()
-            dd_df.columns = ["Index","Drawdown"]
-
-            fig_dd = go.Figure()
-            fig_dd.add_trace(go.Scatter(
-                x=dd_df["Index"], y=dd_df["Drawdown"] * 100,
-                fill="tozeroy", fillcolor="rgba(194,65,65,0.15)",
-                line=dict(color="#c24141", width=1.5), name="Drawdown %"))
-            fig_dd.update_layout(
-                title="Drawdown %",
-                height=220, template="plotly_white",
-                margin=dict(l=0,r=0,t=40,b=0),
-                yaxis_ticksuffix="%", font=dict(size=11), showlegend=False)
-            st.plotly_chart(fig_dd, use_container_width=True)
-
-            # ── Summary Table ────────────────────────────────────────────────
-            st.markdown("#### Metrics Summary")
-            summary = pd.DataFrame({
-                "Metric": labels,
-                "Value":  [f"{v:+.2f}" for v in values],
-            })
-            st.dataframe(summary, use_container_width=True, hide_index=True)
+                fig_cmp = go.Figure()
+                fig_cmp.add_trace(go.Scatter(x=al_df["Date"], y=al_df["Absolute Longs"],
+                    name="Absolute Longs", line=dict(color="#008a58", width=2)))
+                fig_cmp.add_trace(go.Scatter(x=bf_df["Date"], y=bf_df["Bottom-Fishing"],
+                    name="Bottom-Fishing", line=dict(color="#c24141", width=2)))
+                fig_cmp.add_trace(go.Scatter(x=bk_df["Date"], y=bk_df["Benchmark"],
+                    name="Benchmark", line=dict(color="#888888", width=1.5, dash="dot")))
+                fig_cmp.update_layout(
+                    title="Equity Curve Overlay — ₹1,00,000 Starting Capital",
+                    height=380, template="plotly_white",
+                    margin=dict(l=0,r=0,t=40,b=0),
+                    legend=dict(orientation="h", y=1.08),
+                    yaxis_tickprefix="₹", font=dict(size=11))
+                st.plotly_chart(fig_cmp, use_container_width=True)
     else:
-        st.info("Click **▶ Run Backtest** to fetch 1 year of data and compute performance metrics.")
+        st.info("Click **▶ Run Backtest** to fetch 1 year of data and compute performance metrics for both strategies.")
