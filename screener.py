@@ -272,9 +272,9 @@ def compute_indicators(data: pd.DataFrame) -> pd.DataFrame:
     ).map({True: "YES", False: "NO"})
 
     data["Bottom_Fishing"] = (
-        (data["EMA_10"] > data["EMA_20"]) &
-        (data["RSI_14"] > 50) &
-        (data["MACD_hist"] > 0) &
+        (data["EMA_10"] < data["EMA_20"]) &
+        (data["RSI_14"] < 50) &
+        (data["MACD_hist"] < 0) &
         (data["Supertrend_Signal"] == "SELL")
     ).map({True: "YES", False: "NO"})
 
