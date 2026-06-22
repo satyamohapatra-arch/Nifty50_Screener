@@ -301,6 +301,7 @@ def run(log=print):
     processed = (
         master.groupby("Stock", group_keys=False)
               .apply(compute_indicators)
+              .reset_index(drop=True)   # ensure Stock col is retained as regular col
     )
 
     # 3. Take latest row per stock
