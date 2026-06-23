@@ -13,6 +13,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import yfinance as yf
 from datetime import datetime, timedelta
+from xgboost import XGBClassifier, XGBRegressor
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -43,6 +44,19 @@ NIFTY50_TICKERS = [
     "BAJAJ-AUTO","TRENT","BEL","SHRIRAMFIN","HDFCLIFE",
 ]
 NIFTY50_SYMBOLS = [t + ".NS" for t in NIFTY50_TICKERS]
+
+FORWARD_N = 10  # days ahead for ML label
+
+ML_FEATURES = [
+    'EMA_10', 'EMA_20', 'EMA_50',
+    'SMA_20', 'SMA_50', 'RSI_14',
+    'MACD_line', 'MACD_signal', 'MACD_hist',
+    'Stoch_K', 'Stoch_D',
+    'ADX_14', 'ATR_14',
+    'BB_Upper', 'BB_Middle', 'BB_Lower',
+    'OBV', 'VWAP',
+    'Returns', 'Volatility',
+]
 
 ALL_INDICATORS = {
     "Close Price":          ("Close",             0,    10000, 500),
@@ -414,6 +428,201 @@ def run_backtest(raw_df, strategy="absolute_longs"):
 
     return metrics, eq_curve_chart, bench_chart, drawdown
 
+# ── ML: FETCH HISTORY ─────────────────────────────────────────────────────────
+def fetch_ml_history(progress_placeholder):
+    """Fetch 3 years OHLCV for all Nifty 50 — needed for enough training rows."""
+    end   = datetime.today()
+    start = end - timedelta(days=3 * 365)
+    frames = []
+    bar = progress_placeholder.progress(0, text="Fetching price history...")
+    for i, sym in enumerate(NIFTY50_SYMBOLS):
+        try:
+            df = yf.download(sym, start=start.strftime("%Y-%m-%d"),
+                             end=end.strftime("%Y-%m-%d"),
+                             interval="1d", auto_adjust=False, progress=False)
+            if df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.reset_index()[["Date","Open","High","Low","Close","Volume"]]
+            df["Stock"] = sym
+            frames.append(df)
+        except Exception:
+            pass
+        bar.progress((i + 1) / len(NIFTY50_SYMBOLS),
+                     text=f"Fetching {sym} ({i+1}/{len(NIFTY50_SYMBOLS)})...")
+    bar.empty()
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+# ── ML: COMPUTE INDICATORS ────────────────────────────────────────────────────
+def compute_ml_indicators(data):
+    data = data.sort_values("Date").copy()
+    close = data["Close"].astype(float)
+    high  = data["High"].astype(float)
+    low   = data["Low"].astype(float)
+    vol   = data["Volume"].astype(float)
+
+    for w in [20, 50]:
+        data[f"SMA_{w}"] = close.rolling(w).mean()
+    for w in [10, 20, 50]:
+        data[f"EMA_{w}"] = close.ewm(span=w, adjust=False).mean()
+
+    delta    = close.diff()
+    gain     = delta.clip(lower=0)
+    loss     = (-delta).clip(lower=0)
+    data["RSI_14"] = 100 - (100 / (
+        1 + gain.ewm(alpha=1/14, adjust=False).mean() /
+            (loss.ewm(alpha=1/14, adjust=False).mean() + 1e-10)
+    ))
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    data["MACD_line"]   = ema12 - ema26
+    data["MACD_signal"] = data["MACD_line"].ewm(span=9, adjust=False).mean()
+    data["MACD_hist"]   = data["MACD_line"] - data["MACD_signal"]
+
+    low14  = low.rolling(14).min()
+    high14 = high.rolling(14).max()
+    data["Stoch_K"] = 100 * (close - low14) / (high14 - low14 + 1e-10)
+    data["Stoch_D"] = data["Stoch_K"].rolling(3).mean()
+
+    hl  = high - low
+    hcp = (high - close.shift()).abs()
+    lcp = (low  - close.shift()).abs()
+    tr  = pd.concat([hl, hcp, lcp], axis=1).max(axis=1)
+    data["ATR_14"] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+    up   = high.diff()
+    down = low.shift() - low
+    pdm  = pd.Series(np.where((up > down) & (up > 0), up, 0), index=data.index)
+    mdm  = pd.Series(np.where((down > up) & (down > 0), down, 0), index=data.index)
+    atr_s = data["ATR_14"].replace(0, 1e-10)
+    pdi   = 100 * pdm.ewm(alpha=1/14, adjust=False).mean() / atr_s
+    mdi   = 100 * mdm.ewm(alpha=1/14, adjust=False).mean() / atr_s
+    dx    = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-10)
+    data["ADX_14"] = dx.ewm(alpha=1/14, adjust=False).mean()
+
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    data["BB_Upper"]  = bb_mid + 2 * bb_std
+    data["BB_Middle"] = bb_mid
+    data["BB_Lower"]  = bb_mid - 2 * bb_std
+
+    obv = np.zeros(len(data))
+    cv  = close.values
+    vv  = vol.values
+    for i in range(1, len(data)):
+        if cv[i] > cv[i-1]:   obv[i] = obv[i-1] + vv[i]
+        elif cv[i] < cv[i-1]: obv[i] = obv[i-1] - vv[i]
+        else:                  obv[i] = obv[i-1]
+    data["OBV"] = obv
+
+    tp = (high + low + close) / 3
+    data["VWAP"] = (tp * vol).rolling(14).sum() / (vol.rolling(14).sum() + 1e-10)
+
+    data["Returns"]    = close.pct_change() * 100
+    data["Volatility"] = data["Returns"].rolling(20).std()
+
+    # Supertrend for flag feature
+    atr7       = tr.ewm(span=7, adjust=False).mean()
+    hl2        = (high + low) / 2
+    upper_band = (hl2 + 3 * atr7).values
+    lower_band = (hl2 - 3 * atr7).values
+    n = len(data)
+    supertrend = np.zeros(n)
+    signal     = [""] * n
+    supertrend[0] = upper_band[0]
+    signal[0]     = "SELL"
+    for i in range(1, n):
+        if cv[i] > supertrend[i-1]:
+            supertrend[i] = lower_band[i]; signal[i] = "BUY"
+        else:
+            supertrend[i] = upper_band[i]; signal[i] = "SELL"
+    data["Supertrend_Signal"] = signal
+
+    return data
+
+# ── ML: TRAIN + PREDICT ───────────────────────────────────────────────────────
+def run_ml_pipeline(raw_df, forward_n=FORWARD_N):
+    frames = []
+    for stock, grp in raw_df.groupby("Stock"):
+        result = compute_ml_indicators(grp.copy())
+        result["Stock"] = stock
+        frames.append(result)
+    combined = pd.concat(frames, ignore_index=True).sort_values(["Stock","Date"])
+
+    # Forward return labels
+    combined["_fwd_close"]      = combined.groupby("Stock")["Close"].shift(-forward_n)
+    combined["_fwd_return_pct"] = (combined["_fwd_close"] - combined["Close"]) / (combined["Close"] + 1e-10) * 100
+    combined["_label_dir"]      = (combined["_fwd_return_pct"] > 0).astype(int)
+    combined["_st_flag"]        = (combined["Supertrend_Signal"] == "BUY").astype(int)
+
+    feat_cols = [f for f in ML_FEATURES if f in combined.columns] + ["_st_flag"]
+
+    train_df = combined.dropna(subset=feat_cols + ["_label_dir", "_fwd_return_pct"]).copy()
+    X_train  = train_df[feat_cols].fillna(0)
+    y_cls    = train_df["_label_dir"]
+    y_reg    = train_df["_fwd_return_pct"]
+
+    clf = XGBClassifier(
+        n_estimators=300, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric="logloss", random_state=42, n_jobs=-1,
+    )
+    clf.fit(X_train, y_cls)
+
+    reg = XGBRegressor(
+        n_estimators=300, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric="rmse", random_state=42, n_jobs=-1,
+    )
+    reg.fit(X_train, y_reg)
+
+    latest_idx = combined.groupby("Stock")["Date"].idxmax()
+    pred_df    = combined.loc[latest_idx].copy()
+    X_pred     = pred_df[feat_cols].fillna(0)
+
+    pred_df["Bull_Probability"]     = clf.predict_proba(X_pred)[:, 1].round(4)
+    pred_df["Predicted_Direction"]  = np.where(pred_df["Bull_Probability"] >= 0.5, "BULL", "BEAR")
+    pred_df["Predicted_Return_Pct"] = reg.predict(X_pred).round(2)
+
+    # Strategy flags on latest row
+    pred_df["Absolute_Longs"] = (
+        (pred_df.get("EMA_10", pd.Series(dtype=float)) > pred_df.get("EMA_20", pd.Series(dtype=float))) &
+        (pred_df["RSI_14"] > 50) &
+        (pred_df["MACD_hist"] > 0) &
+        (pred_df["Supertrend_Signal"] == "BUY")
+    ).map({True: "YES", False: "NO"})
+
+    pred_df["Bottom_Fishing"] = (
+        (pred_df.get("EMA_10", pd.Series(dtype=float)) < pred_df.get("EMA_20", pd.Series(dtype=float))) &
+        (pred_df["RSI_14"] < 50) &
+        (pred_df["MACD_hist"] < 0) &
+        (pred_df["Supertrend_Signal"] == "SELL")
+    ).map({True: "YES", False: "NO"})
+
+    result = pred_df[[
+        "Stock", "Date", "Close",
+        "Predicted_Direction", "Bull_Probability", "Predicted_Return_Pct",
+        "Absolute_Longs", "Bottom_Fishing",
+    ]].copy()
+    result["Date"] = pd.to_datetime(result["Date"]).dt.strftime("%Y-%m-%d")
+    result = result.sort_values("Predicted_Return_Pct", ascending=False).reset_index(drop=True)
+
+    return result
+
+# ── ML: PUSH TO SHEET 2 ───────────────────────────────────────────────────────
+def push_ml_to_sheet(ml_df):
+    gc = get_gc()
+    sh = gc.open_by_key(SHEET_ID)
+    try:
+        ws2 = sh.get_worksheet(1)
+    except Exception:
+        ws2 = sh.add_worksheet(title="ML Predictions", rows=200, cols=20)
+    ws2.clear()
+    gd.set_with_dataframe(ws2, ml_df)
+    return ws2.title
+
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
 for key, default in [
     ("filters", []), ("logic", "AND"), ("presets", load_presets()),
@@ -550,8 +759,8 @@ with st.sidebar:
         use_container_width=True)
 
 # ── MAIN TABS ─────────────────────────────────────────────────────────────────
-tab_screen, tab_detail, tab_perf = st.tabs([
-    "📋 Screener", "🔍 Stock Detail", "📈 Performance"
+tab_screen, tab_detail, tab_perf, tab_ml = st.tabs([
+    "📋 Screener", "🔍 Stock Detail", "📈 Performance", "🤖 ML Predictions"
 ])
 
 with st.spinner("Loading data..."):
@@ -917,3 +1126,124 @@ with tab_perf:
                 st.plotly_chart(fig_cmp, use_container_width=True)
     else:
         st.info("Click **▶ Run Backtest** to fetch 1 year of data and compute performance metrics for both strategies.")
+
+# ── TAB 4: ML PREDICTIONS ─────────────────────────────────────────────────────
+with tab_ml:
+    st.markdown("## 🤖 ML Predictions")
+    st.caption(f"XGBoost classifier + regressor · Trained on 3Y history · Predicts direction & return over next {FORWARD_N} days")
+
+    st.markdown("""
+    <div style="background:#f0f4ff;border:1px solid #c5d3f5;border-radius:10px;padding:14px 18px;margin-bottom:16px;font-size:13px;color:#333">
+      <strong>How it works:</strong> Fetches 3 years of OHLCV → computes 20 indicators → trains two XGBoost models on all historical rows →
+      predicts on latest row per stock.<br>
+      <strong>Output:</strong> BULL/BEAR direction, bull probability (0–1), expected % return over {FORWARD_N} days.
+      Results pushed to <em>Sheet 2 (ML Predictions)</em> in your Google Sheet.
+    </div>
+    """.format(FORWARD_N=FORWARD_N), unsafe_allow_html=True)
+
+    run_ml = st.button("▶ Run ML Pipeline", type="primary", key="run_ml_btn")
+
+    if "ml_results" not in st.session_state:
+        st.session_state.ml_results = None
+
+    if run_ml:
+        prog = st.empty()
+        with st.spinner("Fetching 3 years of data for 50 stocks..."):
+            raw_df = fetch_ml_history(prog)
+
+        if raw_df.empty:
+            st.error("Could not fetch price data. Check internet connection.")
+        else:
+            with st.spinner(f"Computing indicators + training XGBoost (300 trees × 2 models)..."):
+                ml_df = run_ml_pipeline(raw_df, forward_n=FORWARD_N)
+            with st.spinner("Pushing results to Google Sheet 2..."):
+                sheet_name = push_ml_to_sheet(ml_df)
+            st.session_state.ml_results = ml_df
+            st.success(f"Done! Results pushed to '{sheet_name}' ({len(ml_df)} stocks)")
+
+    if st.session_state.ml_results is not None:
+        ml_df = st.session_state.ml_results
+
+        # ── Summary metrics ────────────────────────────────────────────────────
+        bull_n = (ml_df["Predicted_Direction"] == "BULL").sum()
+        bear_n = (ml_df["Predicted_Direction"] == "BEAR").sum()
+        avg_prob = ml_df["Bull_Probability"].mean()
+        avg_ret  = ml_df["Predicted_Return_Pct"].mean()
+
+        m1, m2, m3, m4 = st.columns(4, gap="small")
+        m1.metric("BULL signals",    int(bull_n))
+        m2.metric("BEAR signals",    int(bear_n))
+        m3.metric("Avg Bull Prob",   f"{avg_prob:.2%}")
+        m4.metric(f"Avg Pred Return ({FORWARD_N}d)", f"{avg_ret:+.2f}%")
+        st.divider()
+
+        # ── Filter controls ───────────────────────────────────────────────────
+        f1, f2, f3 = st.columns([2, 2, 3])
+        with f1:
+            dir_filter = st.selectbox("Direction", ["All", "BULL", "BEAR"], key="ml_dir")
+        with f2:
+            min_prob = st.slider("Min Bull Probability", 0.0, 1.0, 0.0, 0.05, key="ml_prob")
+        with f3:
+            sort_col = st.selectbox("Sort by", ["Predicted_Return_Pct", "Bull_Probability", "Close"], key="ml_sort")
+
+        disp = ml_df.copy()
+        if dir_filter != "All":
+            disp = disp[disp["Predicted_Direction"] == dir_filter]
+        disp = disp[disp["Bull_Probability"] >= min_prob]
+        disp = disp.sort_values(sort_col, ascending=(sort_col == "Close"))
+
+        # ── Table ─────────────────────────────────────────────────────────────
+        rows = []
+        for _, row in disp.iterrows():
+            stock   = str(row["Stock"]).replace(".NS", "")
+            dir_val = str(row["Predicted_Direction"])
+            prob    = float(row["Bull_Probability"])
+            ret     = float(row["Predicted_Return_Pct"])
+            close   = row["Close"]
+
+            dir_badge = (
+                f'<span class="badge-buy">{dir_val}</span>' if dir_val == "BULL"
+                else f'<span class="badge-sell">{dir_val}</span>'
+            )
+            prob_color = "#008a58" if prob >= 0.6 else ("#e07c00" if prob >= 0.5 else "#c24141")
+            ret_cls    = "up" if ret > 0 else "dn"
+
+            rows.append(f"""<tr>
+              <td><strong>{stock}</strong></td>
+              <td>{fmt(close)}</td>
+              <td>{dir_badge}</td>
+              <td><span style="color:{prob_color};font-weight:700">{prob:.2%}</span></td>
+              <td><span class="{ret_cls}">{ret:+.2f}%</span></td>
+              <td>{flag_badge(row.get("Absolute_Longs","NO"))}</td>
+              <td>{flag_badge(row.get("Bottom_Fishing","NO"))}</td>
+            </tr>""")
+
+        st.markdown(f"""
+        <div class="tbl-wrap">
+          <table class="screener-table">
+            <thead><tr>
+              <th>Stock</th><th>Close</th><th>Direction</th>
+              <th>Bull Prob</th><th>Pred Return ({FORWARD_N}d)</th>
+              <th>Abs Longs</th><th>Bot-Fish</th>
+            </tr></thead>
+            <tbody>{"".join(rows)}</tbody>
+          </table>
+        </div>""", unsafe_allow_html=True)
+        st.caption(f"{len(disp)} stocks shown")
+        st.download_button("⬇ Download CSV", disp.to_csv(index=False),
+            file_name="ml_predictions.csv", mime="text/csv")
+
+        # ── Bull probability distribution chart ───────────────────────────────
+        fig_prob = px.histogram(
+            ml_df, x="Bull_Probability", nbins=20,
+            title="Bull Probability Distribution",
+            color_discrete_sequence=["#2e75b6"],
+            labels={"Bull_Probability": "Bull Probability"},
+        )
+        fig_prob.add_vline(x=0.5, line_dash="dash", line_color="#c24141", line_width=1.5)
+        fig_prob.update_layout(height=280, template="plotly_white",
+            margin=dict(l=0, r=0, t=40, b=0), font=dict(size=11))
+        st.plotly_chart(fig_prob, use_container_width=True)
+
+    else:
+        st.info("Click **▶ Run ML Pipeline** to fetch data, train models, and generate predictions.")
