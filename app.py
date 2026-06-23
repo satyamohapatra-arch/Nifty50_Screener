@@ -213,7 +213,6 @@ def get_gc():
         with open("service_account.json") as f:
             info = json.load(f)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    # gspread >= 6 — use Client directly instead of deprecated gspread.authorize()
     return gspread.Client(auth=creds)
 
 @st.cache_data(ttl=300)
@@ -337,8 +336,6 @@ def run_backtest(raw_df, strategy="absolute_longs"):
     strategy: 'absolute_longs' or 'bottom_fishing'
     Pool all stocks together, compute aggregate metrics.
     """
-    # Loop per stock explicitly — avoids pandas 2.x groupby.apply()
-    # swallowing the "Stock" column as the index key
     frames = []
     for stock, grp in raw_df.groupby("Stock"):
         result = compute_bt_indicators(grp.copy())
@@ -361,9 +358,7 @@ def run_backtest(raw_df, strategy="absolute_longs"):
             (bt["Supertrend_Signal"] == "SELL")
         ).astype(int)
 
-    # Avoid look-ahead bias — same as notebook
     bt["Position"] = bt.groupby("Stock")["Position"].shift(1)
-
     bt["Strategy_Return"] = bt["Position"] * bt["Daily_Return"]
 
     returns = bt["Strategy_Return"].dropna()
@@ -393,7 +388,6 @@ def run_backtest(raw_df, strategy="absolute_longs"):
     gross_loss   = abs(trades[trades < 0].sum())
     profit_factor = gross_profit / gross_loss if gross_loss != 0 else np.inf
 
-    # Benchmark — equal-weight buy & hold across all stocks
     benchmark_returns = bt.groupby("Date")["Daily_Return"].mean().dropna()
     benchmark_equity  = initial_capital * (1 + benchmark_returns).cumprod()
     bench_years       = len(benchmark_returns) / 252
@@ -410,7 +404,6 @@ def run_backtest(raw_df, strategy="absolute_longs"):
         "Benchmark CAGR %": round(benchmark_cagr * 100, 2),
     }
 
-    # Build dated equity curve for chart (aggregate by date)
     eq_by_date = (
         bt.groupby("Date")["Strategy_Return"]
           .mean()
@@ -557,8 +550,8 @@ with st.sidebar:
         use_container_width=True)
 
 # ── MAIN TABS ─────────────────────────────────────────────────────────────────
-tab_screen, tab_detail, tab_heatmap, tab_perf = st.tabs([
-    "📋 Screener", "🔍 Stock Detail", "🗺 Sector Heatmap", "📈 Performance"
+tab_screen, tab_detail, tab_perf = st.tabs([
+    "📋 Screener", "🔍 Stock Detail", "📈 Performance"
 ])
 
 with st.spinner("Loading data..."):
@@ -655,7 +648,6 @@ with tab_detail:
             st.markdown(f"### {selected} &nbsp; <span style='font-size:14px;color:#888'>{row.get('Sector','')}</span>",
                         unsafe_allow_html=True)
 
-            # Fetch 1Y history live for the chart
             with st.spinner("Loading chart data..."):
                 try:
                     end_dt   = datetime.today()
@@ -701,7 +693,6 @@ with tab_detail:
                     legend=dict(orientation="h", y=1.08), font=dict(size=11))
                 st.plotly_chart(fig, use_container_width=True)
 
-                # RSI sub-chart
                 delta    = hist["Close"].diff()
                 ag       = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
                 al_      = (-delta).clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
@@ -719,7 +710,6 @@ with tab_detail:
             else:
                 st.info("Chart data unavailable for this stock.")
 
-            # Indicator snapshot
             st.markdown("#### Indicator Snapshot")
             ind_groups = {
                 "📈 Trend":     [("EMA 10","EMA_10"),("EMA 20","EMA_20"),("SMA 50","SMA_50"),
@@ -777,60 +767,7 @@ with tab_detail:
                   <div style="font-size:11px;color:#888;margin-top:4px">Reversal signal</div>
                 </div>""", unsafe_allow_html=True)
 
-# ── TAB 3: SECTOR HEATMAP ─────────────────────────────────────────────────────
-with tab_heatmap:
-    st.markdown("## Sector Heatmap")
-    st.caption("Average return and signal counts by sector")
-
-    if "Sector" in df.columns and "Returns" in df.columns:
-        heatmap_df   = filtered if st.session_state.filters else df
-        sector_stats = heatmap_df.groupby("Sector").agg(
-            Stocks      =("Stock","count"),
-            Avg_Return  =("Returns","mean"),
-            BUY_Count   =("Supertrend_Signal", lambda x: (x.astype(str).str.upper()=="BUY").sum()),
-            AL_Count    =("Absolute_Longs",    lambda x: (x.astype(str).str.upper()=="YES").sum()),
-            BF_Count    =("Bottom_Fishing",    lambda x: (x.astype(str).str.upper()=="YES").sum()),
-        ).reset_index().sort_values("Avg_Return", ascending=False)
-
-        fig_heat = px.bar(sector_stats, x="Sector", y="Avg_Return",
-            color="Avg_Return",
-            color_continuous_scale=["#c24141","#f5e6e6","#e6f4ee","#008a58"],
-            color_continuous_midpoint=0,
-            text=sector_stats["Avg_Return"].apply(lambda x: f"{x:+.2f}%"),
-            title="Average Return % by Sector",
-            labels={"Avg_Return":"Avg Return (%)"},
-        )
-        fig_heat.update_traces(textposition="outside")
-        fig_heat.update_layout(height=380, template="plotly_white",
-            margin=dict(l=0,r=0,t=40,b=0), coloraxis_showscale=False,
-            font=dict(size=11), xaxis_tickangle=-30)
-        st.plotly_chart(fig_heat, use_container_width=True)
-
-        h1, h2 = st.columns(2)
-        with h1:
-            fig_al = px.bar(sector_stats.sort_values("AL_Count", ascending=False),
-                x="Sector", y="AL_Count", title="🚀 Absolute Longs by Sector",
-                color_discrete_sequence=["#2e75b6"], labels={"AL_Count":"Count"})
-            fig_al.update_layout(height=300, template="plotly_white",
-                margin=dict(l=0,r=0,t=40,b=0), font=dict(size=11), xaxis_tickangle=-30)
-            st.plotly_chart(fig_al, use_container_width=True)
-        with h2:
-            fig_bf = px.bar(sector_stats.sort_values("BF_Count", ascending=False),
-                x="Sector", y="BF_Count", title="🎣 Bottom-Fishing by Sector",
-                color_discrete_sequence=["#c24141"], labels={"BF_Count":"Count"})
-            fig_bf.update_layout(height=300, template="plotly_white",
-                margin=dict(l=0,r=0,t=40,b=0), font=dict(size=11), xaxis_tickangle=-30)
-            st.plotly_chart(fig_bf, use_container_width=True)
-
-        st.dataframe(
-            sector_stats.rename(columns={"Avg_Return":"Avg Return %","BUY_Count":"Supertrend BUY",
-                "AL_Count":"Absolute Longs","BF_Count":"Bottom-Fishing"})
-            .style.format({"Avg Return %":"{:+.2f}"}),
-            use_container_width=True, hide_index=True)
-    else:
-        st.info("Sector data not available. Run screener first.")
-
-# ── TAB 4: PERFORMANCE ────────────────────────────────────────────────────────
+# ── TAB 3: PERFORMANCE ────────────────────────────────────────────────────────
 with tab_perf:
     st.markdown("## Strategy Performance")
     st.caption("Last 1 year · All Nifty 50 stocks pooled · Position shifted 1 day to avoid look-ahead bias")
@@ -878,7 +815,6 @@ with tab_perf:
                 </div>""", unsafe_allow_html=True)
         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
-        # Equity curve
         eq_df = pd.DataFrame({
             "Date":      eq_curve.index,
             "Strategy":  eq_curve.values,
@@ -899,7 +835,6 @@ with tab_perf:
             yaxis_tickprefix="₹", font=dict(size=11))
         st.plotly_chart(fig_eq, use_container_width=True)
 
-        # Drawdown
         dd_df = drawdown_series.reset_index()
         dd_df.columns = ["Index","Drawdown"]
         fig_dd = go.Figure()
@@ -927,7 +862,6 @@ with tab_perf:
 
             st.divider()
 
-            # ── Side-by-side strategy tabs ────────────────────────────────────
             strat_tab_al, strat_tab_bf, strat_tab_cmp = st.tabs([
                 "🚀 Absolute Longs", "🎣 Bottom-Fishing", "⚖ Comparison"
             ])
@@ -963,7 +897,6 @@ with tab_perf:
                 })
                 st.dataframe(cmp_df, use_container_width=True, hide_index=True)
 
-                # Overlay equity curves
                 al_df = pd.DataFrame({"Date": al_eq.index, "Absolute Longs": al_eq.values})
                 bf_df = pd.DataFrame({"Date": bf_eq.index, "Bottom-Fishing": bf_eq.values})
                 bk_df = pd.DataFrame({"Date": al_bench.index, "Benchmark": al_bench.values})
