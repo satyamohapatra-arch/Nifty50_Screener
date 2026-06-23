@@ -622,8 +622,8 @@ def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
     pred_df    = combined.loc[latest_idx].copy()
     X_pred     = pred_df[feat_cols].fillna(0)
 
-    pred_df["Probability"]     = clf.predict_proba(X_pred)[:, 1].round(4)
-    pred_df["Predicted_Direction"]  = np.where(pred_df["Probability"] >= 0.5, "BULL", "BEAR")
+    pred_df["Bull_Probability"]     = clf.predict_proba(X_pred)[:, 1].round(4)
+    pred_df["Predicted_Direction"]  = np.where(pred_df["Bull_Probability"] >= 0.5, "BULL", "BEAR")
     pred_df["Predicted_Return_Pct"] = reg.predict(X_pred).round(2)
     pred_df["Predicted_Price"]      = (pred_df["Close"] * (1 + pred_df["Predicted_Return_Pct"] / 100)).round(2)
 
@@ -635,7 +635,7 @@ def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
     result = pred_df[[
         "Stock", "As_Of_Date", "Close", "Target_Date",
         "Predicted_Price", "Predicted_Return_Pct",
-        "Predicted_Direction", "Probability",
+        "Predicted_Direction", "Bull_Probability",
     ]].copy()
     result = result.sort_values("Predicted_Return_Pct", ascending=False).reset_index(drop=True)
     return result, test_acc
@@ -1234,7 +1234,7 @@ with tab_ml:
         with df1:
             dir_f2 = st.selectbox("Direction", ["All","BULL","BEAR"], key="date_ml_dir")
         with df2:
-            sort_f2 = st.selectbox("Sort by", ["Predicted_Return_Pct","Probability","Predicted_Price"], key="date_ml_sort")
+            sort_f2 = st.selectbox("Sort by", ["Predicted_Return_Pct","Bull_Probability","Predicted_Price"], key="date_ml_sort")
 
         disp2 = date_pred.copy()
         if dir_f2 != "All":
@@ -1246,7 +1246,7 @@ with tab_ml:
         for _, row in disp2.iterrows():
             stock    = str(row["Stock"]).replace(".NS", "")
             dir_val  = str(row["Predicted_Direction"])
-            prob     = float(row["Probability"])
+            prob     = float(row["Bull_Probability"])
             ret      = float(row["Predicted_Return_Pct"])
             close_p  = row["Close"]
             pred_p   = row["Predicted_Price"]
@@ -1277,7 +1277,7 @@ with tab_ml:
               <th>Predicted Price</th>
               <th>Target Date</th>
               <th>Direction</th>
-              <th>Probability</th>
+              <th>Bull Prob</th>
               <th>Pred Return</th>
             </tr></thead>
             <tbody>{"".join(rows2)}</tbody>
