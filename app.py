@@ -1234,7 +1234,7 @@ with tab_ml:
         with df1:
             dir_f2 = st.selectbox("Direction", ["All","BULL","BEAR"], key="date_ml_dir")
         with df2:
-            sort_f2 = st.selectbox("Sort by", ["Predicted_Return_Pct","Bull_Probability","Predicted_Price"], key="date_ml_sort")
+            sort_f2 = st.selectbox("Sort by", ["Predicted_Return_Pct","Probability","Predicted_Price"], key="date_ml_sort")
 
         disp2 = date_pred.copy()
         if dir_f2 != "All":
