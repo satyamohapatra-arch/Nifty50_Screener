@@ -1277,7 +1277,7 @@ with tab_ml:
               <th>Predicted Price</th>
               <th>Target Date</th>
               <th>Direction</th>
-              <th>Bull Prob</th>
+              <th>Probability</th>
               <th>Pred Return</th>
             </tr></thead>
             <tbody>{"".join(rows2)}</tbody>
