@@ -1146,10 +1146,9 @@ with tab_perf:
 
 # ── TAB 4: ML PREDICTIONS ─────────────────────────────────────────────────────
 with tab_ml:
-    st.markdown("## 🤖 ML Predictions")
+    st.markdown("## 📅 Date-Based Prediction Panel")
 
-    # ── DATE-BASED PREDICTION PANEL ───────────────────────────────────────────
-    st.markdown("### 📅 Date-Based Prediction Panel")
+    # ── DATE-BASED PREDICTION PANEL ───────────────────────────────────────────    
     st.caption(
         "Pick a date D → Train on [D−6m, D−2m] → Validate on [D−2m, D] → "
         "Predict price 10 trading days after D"
