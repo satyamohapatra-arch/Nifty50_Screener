@@ -623,19 +623,37 @@ def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
     X_pred     = pred_df[feat_cols].fillna(0)
 
     pred_df["Bull_Probability"]     = clf.predict_proba(X_pred)[:, 1].round(4)
+    pred_df["Bear_Probability"]     = (1 - pred_df["Bull_Probability"]).round(4)
     pred_df["Predicted_Direction"]  = np.where(pred_df["Bull_Probability"] >= 0.5, "BULL", "BEAR")
     pred_df["Predicted_Return_Pct"] = reg.predict(X_pred).round(2)
     pred_df["Predicted_Price"]      = (pred_df["Close"] * (1 + pred_df["Predicted_Return_Pct"] / 100)).round(2)
 
+    # Strategy flags
+    pred_df["Absolute_Longs"] = (
+        (pred_df["EMA_10"] > pred_df["EMA_20"]) &
+        (pred_df["RSI_14"] > 50) &
+        (pred_df["MACD_hist"] > 0) &
+        (pred_df["Supertrend_Signal"] == "BUY")
+    ).map({True: "YES", False: "NO"})
+
+    pred_df["Bottom_Fishing"] = (
+        (pred_df["EMA_10"] < pred_df["EMA_20"]) &
+        (pred_df["RSI_14"] < 50) &
+        (pred_df["MACD_hist"] < 0) &
+        (pred_df["Supertrend_Signal"] == "SELL")
+    ).map({True: "YES", False: "NO"})
+
     # Target date = D + 10 trading days
     target_date = D + BDay(forward_n)
-    pred_df["Target_Date"] = target_date.strftime("%Y-%m-%d")
-    pred_df["As_Of_Date"]  = D.strftime("%Y-%m-%d")
+    pred_df["Target_Date"]      = target_date.strftime("%Y-%m-%d")
+    pred_df["As_Of_Date"]       = D.strftime("%Y-%m-%d")
+    pred_df["Stock_Universe"]   = "NIFTY50"
 
     result = pred_df[[
-        "Stock", "As_Of_Date", "Close", "Target_Date",
-        "Predicted_Price", "Predicted_Return_Pct",
-        "Predicted_Direction", "Bull_Probability",
+        "Stock_Universe", "Stock", "As_Of_Date", "Close",
+        "Predicted_Price", "Predicted_Direction",
+        "Bull_Probability", "Bear_Probability",
+        "Predicted_Return_Pct", "Absolute_Longs", "Bottom_Fishing",
     ]].copy()
     result = result.sort_values("Predicted_Return_Pct", ascending=False).reset_index(drop=True)
     return result, test_acc
@@ -1235,58 +1253,73 @@ with tab_ml:
         with df1:
             dir_f2 = st.selectbox("Direction", ["All","BULL","BEAR"], key="date_ml_dir")
         with df2:
-            sort_f2 = st.selectbox("Sort by", ["Predicted_Return_Pct","Probability","Predicted_Price"], key="date_ml_sort")
+            sort_f2 = st.selectbox(
+                "Sort by",
+                ["Predicted_Return_Pct", "Bull_Probability", "Bear_Probability", "Predicted_Price"],
+                key="date_ml_sort",
+            )
 
         disp2 = date_pred.copy()
         if dir_f2 != "All":
             disp2 = disp2[disp2["Predicted_Direction"] == dir_f2]
-        sort_col_map = {"Probability": "Bull_Probability"}
-        sort_f2_col  = sort_col_map.get(sort_f2, sort_f2)
-        disp2 = disp2.sort_values(sort_f2_col, ascending=(sort_f2_col == "Predicted_Price"))
+        disp2 = disp2.sort_values(sort_f2, ascending=(sort_f2 == "Predicted_Price"))
 
         # Table
         rows2 = []
         for _, row in disp2.iterrows():
-            stock    = str(row["Stock"]).replace(".NS", "")
-            dir_val  = str(row["Predicted_Direction"])
-            prob     = float(row["Bull_Probability"])
-            ret      = float(row["Predicted_Return_Pct"])
-            close_p  = row["Close"]
-            pred_p   = row["Predicted_Price"]
-            tgt_date = row["Target_Date"]
+            stock      = str(row["Stock"]).replace(".NS", "")
+            universe   = str(row["Stock_Universe"])
+            as_of      = str(row["As_Of_Date"])
+            dir_val    = str(row["Predicted_Direction"])
+            bull_prob  = float(row["Bull_Probability"])
+            bear_prob  = float(row["Bear_Probability"])
+            ret        = float(row["Predicted_Return_Pct"])
+            close_p    = row["Close"]
+            pred_p     = row["Predicted_Price"]
+            abs_longs  = str(row["Absolute_Longs"])
+            bot_fish   = str(row["Bottom_Fishing"])
 
-            dir_badge  = (f'<span class="badge-buy">{dir_val}</span>' if dir_val == "BULL"
-                          else f'<span class="badge-sell">{dir_val}</span>')
-            prob_color = "#008a58" if prob >= 0.6 else ("#e07c00" if prob >= 0.5 else "#c24141")
-            ret_cls    = "up" if ret > 0 else "dn"
-            price_cls  = "up" if pred_p > close_p else "dn"
+            dir_badge       = (f'<span class="badge-buy">{dir_val}</span>' if dir_val == "BULL"
+                               else f'<span class="badge-sell">{dir_val}</span>')
+            bull_prob_color = "#008a58" if bull_prob >= 0.6 else ("#e07c00" if bull_prob >= 0.5 else "#c24141")
+            bear_prob_color = "#c24141" if bear_prob >= 0.6 else ("#e07c00" if bear_prob >= 0.5 else "#008a58")
+            ret_cls         = "up" if ret > 0 else "dn"
+            price_cls       = "up" if pred_p > close_p else "dn"
 
             rows2.append(f"""<tr>
+              <td>{universe}</td>
               <td><strong>{stock}</strong></td>
+              <td>{as_of}</td>
               <td>{fmt(close_p)}</td>
               <td><span class="{price_cls}">{fmt(pred_p)}</span></td>
-              <td>{tgt_date}</td>
               <td>{dir_badge}</td>
-              <td><span style="color:{prob_color};font-weight:700">{prob:.2%}</span></td>
+              <td><span style="color:{bull_prob_color};font-weight:700">{bull_prob:.2%}</span></td>
+              <td><span style="color:{bear_prob_color};font-weight:700">{bear_prob:.2%}</span></td>
               <td><span class="{ret_cls}">{ret:+.2f}%</span></td>
+              <td>{flag_badge(abs_longs)}</td>
+              <td>{flag_badge(bot_fish)}</td>
             </tr>""")
 
         st.markdown(f"""
         <div class="tbl-wrap">
           <table class="screener-table">
             <thead><tr>
+              <th>Stock Universe</th>
               <th>Stock</th>
-              <th>Close (as of {sel_date})</th>
+              <th>Date</th>
+              <th>Close</th>
               <th>Predicted Price</th>
-              <th>Target Date</th>
-              <th>Direction</th>
-              <th>Probability</th>
-              <th>Pred Return</th>
+              <th>Predicted Direction</th>
+              <th>Bull Probability</th>
+              <th>Bear Probability</th>
+              <th>Predicted Return %</th>
+              <th>Absolute Longs</th>
+              <th>Bottom Fishing</th>
             </tr></thead>
             <tbody>{"".join(rows2)}</tbody>
           </table>
         </div>""", unsafe_allow_html=True)
-        st.caption(f"{len(disp2)} stocks · predictions for {date_pred['Target_Date'].iloc[0]}")
+        st.caption(f"{len(disp2)} stocks · predictions for {date_pred['As_Of_Date'].iloc[0]}")
         st.download_button("⬇ Download CSV", disp2.to_csv(index=False),
             file_name=f"ml_date_predictions_{sel_date}.csv", mime="text/csv")
     else:
