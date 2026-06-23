@@ -1146,9 +1146,10 @@ with tab_perf:
 
 # ── TAB 4: ML PREDICTIONS ─────────────────────────────────────────────────────
 with tab_ml:
-    st.markdown("## 📅 Date-Based Prediction Panel")
+    st.markdown("## 🤖 ML Predictions")
 
-    # ── DATE-BASED PREDICTION PANEL ───────────────────────────────────────────    
+    # ── DATE-BASED PREDICTION PANEL ───────────────────────────────────────────
+    st.markdown("### 📅 Date-Based Prediction Panel")
     st.caption(
         "Pick a date D → Train on [D−6m, D−2m] → Validate on [D−2m, D] → "
         "Predict price 10 trading days after D"
@@ -1234,12 +1235,14 @@ with tab_ml:
         with df1:
             dir_f2 = st.selectbox("Direction", ["All","BULL","BEAR"], key="date_ml_dir")
         with df2:
-            sort_f2 = st.selectbox("Sort by", ["Predicted_Return_Pct","Bull_Probability","Predicted_Price"], key="date_ml_sort")
+            sort_f2 = st.selectbox("Sort by", ["Predicted_Return_Pct","Probability","Predicted_Price"], key="date_ml_sort")
 
         disp2 = date_pred.copy()
         if dir_f2 != "All":
             disp2 = disp2[disp2["Predicted_Direction"] == dir_f2]
-        disp2 = disp2.sort_values(sort_f2, ascending=(sort_f2 == "Predicted_Price"))
+        sort_col_map = {"Probability": "Bull_Probability"}
+        sort_f2_col  = sort_col_map.get(sort_f2, sort_f2)
+        disp2 = disp2.sort_values(sort_f2_col, ascending=(sort_f2_col == "Predicted_Price"))
 
         # Table
         rows2 = []
@@ -1277,7 +1280,7 @@ with tab_ml:
               <th>Predicted Price</th>
               <th>Target Date</th>
               <th>Direction</th>
-              <th>Bull Prob</th>
+              <th>Probability</th>
               <th>Pred Return</th>
             </tr></thead>
             <tbody>{"".join(rows2)}</tbody>
