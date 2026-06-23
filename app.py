@@ -611,6 +611,104 @@ def run_ml_pipeline(raw_df, forward_n=FORWARD_N):
 
     return result
 
+# ── ML: DATE-BASED PIPELINE ──────────────────────────────────────────────────
+def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
+    """
+    Given a chosen date D:
+      Train  : D - 6months → D - 2months
+      Test   : D - 2months → D
+      Predict: 10 trading days after D (future price per stock)
+
+    Returns:
+      pred_df  — all stocks with predicted price / return / direction
+      test_acc — model accuracy on test period (direction accuracy %)
+    """
+    from pandas.tseries.offsets import BDay
+
+    D        = pd.Timestamp(chosen_date)
+    train_start = D - pd.DateOffset(months=6)
+    train_end   = D - pd.DateOffset(months=2)
+    test_start  = train_end
+    test_end    = D
+
+    # Compute indicators per stock
+    frames = []
+    for stock, grp in raw_df.groupby("Stock"):
+        result = compute_ml_indicators(grp.copy())
+        result["Stock"] = stock
+        frames.append(result)
+    combined = pd.concat(frames, ignore_index=True)
+    combined["Date"] = pd.to_datetime(combined["Date"])
+    combined = combined.sort_values(["Stock", "Date"])
+
+    feat_cols = [f for f in ML_FEATURES if f in combined.columns] + ["_st_flag"]
+    combined["_st_flag"] = (combined["Supertrend_Signal"] == "BUY").astype(int)
+
+    # ── TRAIN set ─────────────────────────────────────────────────────────────
+    train_mask = (combined["Date"] >= train_start) & (combined["Date"] < train_end)
+    train_data = combined[train_mask].copy()
+
+    # Forward return label: next 10 trading days
+    train_data["_fwd_close"]      = train_data.groupby("Stock")["Close"].shift(-forward_n)
+    train_data["_fwd_return_pct"] = (train_data["_fwd_close"] - train_data["Close"]) / (train_data["Close"] + 1e-10) * 100
+    train_data["_label_dir"]      = (train_data["_fwd_return_pct"] > 0).astype(int)
+
+    train_clean = train_data.dropna(subset=feat_cols + ["_label_dir", "_fwd_return_pct"])
+    X_train = train_clean[feat_cols].fillna(0)
+    y_cls   = train_clean["_label_dir"]
+    y_reg   = train_clean["_fwd_return_pct"]
+
+    if len(X_train) < 50:
+        return None, None  # not enough data
+
+    clf = XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.05,
+                        subsample=0.8, colsample_bytree=0.8,
+                        eval_metric="logloss", random_state=42, n_jobs=-1)
+    clf.fit(X_train, y_cls)
+
+    reg = XGBRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                       subsample=0.8, colsample_bytree=0.8,
+                       eval_metric="rmse", random_state=42, n_jobs=-1)
+    reg.fit(X_train, y_reg)
+
+    # ── TEST accuracy (May 1 → D window) ──────────────────────────────────────
+    test_mask = (combined["Date"] >= test_start) & (combined["Date"] < test_end)
+    test_data = combined[test_mask].copy()
+    test_data["_fwd_close"]      = test_data.groupby("Stock")["Close"].shift(-forward_n)
+    test_data["_fwd_return_pct"] = (test_data["_fwd_close"] - test_data["Close"]) / (test_data["Close"] + 1e-10) * 100
+    test_data["_label_dir"]      = (test_data["_fwd_return_pct"] > 0).astype(int)
+    test_clean = test_data.dropna(subset=feat_cols + ["_label_dir"])
+    test_acc = None
+    if len(test_clean) > 0:
+        X_test    = test_clean[feat_cols].fillna(0)
+        y_test    = test_clean["_label_dir"]
+        test_preds = clf.predict(X_test)
+        test_acc   = round((test_preds == y_test.values).mean() * 100, 2)
+
+    # ── PREDICT: latest row per stock on or before D ───────────────────────────
+    before_d   = combined[combined["Date"] <= test_end]
+    latest_idx = before_d.groupby("Stock")["Date"].idxmax()
+    pred_df    = combined.loc[latest_idx].copy()
+    X_pred     = pred_df[feat_cols].fillna(0)
+
+    pred_df["Bull_Probability"]     = clf.predict_proba(X_pred)[:, 1].round(4)
+    pred_df["Predicted_Direction"]  = np.where(pred_df["Bull_Probability"] >= 0.5, "BULL", "BEAR")
+    pred_df["Predicted_Return_Pct"] = reg.predict(X_pred).round(2)
+    pred_df["Predicted_Price"]      = (pred_df["Close"] * (1 + pred_df["Predicted_Return_Pct"] / 100)).round(2)
+
+    # Target date = D + 10 trading days
+    target_date = D + BDay(forward_n)
+    pred_df["Target_Date"] = target_date.strftime("%Y-%m-%d")
+    pred_df["As_Of_Date"]  = D.strftime("%Y-%m-%d")
+
+    result = pred_df[[
+        "Stock", "As_Of_Date", "Close", "Target_Date",
+        "Predicted_Price", "Predicted_Return_Pct",
+        "Predicted_Direction", "Bull_Probability",
+    ]].copy()
+    result = result.sort_values("Predicted_Return_Pct", ascending=False).reset_index(drop=True)
+    return result, test_acc
+
 # ── ML: PUSH TO SHEET 2 ───────────────────────────────────────────────────────
 def push_ml_to_sheet(ml_df):
     gc = get_gc()
@@ -1247,3 +1345,144 @@ with tab_ml:
 
     else:
         st.info("Click **▶ Run ML Pipeline** to fetch data, train models, and generate predictions.")
+
+    # ── DATE-BASED PREDICTION PANEL ───────────────────────────────────────────
+    st.divider()
+    st.markdown("### 📅 Date-Based Prediction Panel")
+    st.caption(
+        "Pick a date D → Train on [D−6m, D−2m] → Validate on [D−2m, D] → "
+        "Predict price 10 trading days after D"
+    )
+
+    dp_col1, dp_col2 = st.columns([2, 5])
+    with dp_col1:
+        max_allowed = datetime.today().date() - timedelta(days=1)
+        min_allowed = datetime.today().date() - timedelta(days=3 * 365)
+        chosen_date = st.date_input(
+            "Select Date (D)",
+            value=max_allowed,
+            min_value=min_allowed,
+            max_value=max_allowed,
+            key="ml_date_picker",
+        )
+        run_date_ml = st.button("▶ Run Date Prediction", type="primary", key="run_date_ml_btn")
+
+    with dp_col2:
+        D_ts        = pd.Timestamp(chosen_date)
+        train_s     = (D_ts - pd.DateOffset(months=6)).strftime("%b %d, %Y")
+        train_e     = (D_ts - pd.DateOffset(months=2)).strftime("%b %d, %Y")
+        test_e      = D_ts.strftime("%b %d, %Y")
+        from pandas.tseries.offsets import BDay
+        target_d    = (D_ts + BDay(10)).strftime("%b %d, %Y")
+        st.markdown(f"""
+        <div style="background:#f8f9fa;border:1px solid #e0e0e0;border-radius:10px;
+             padding:14px 18px;font-size:13px;line-height:2">
+          <span style="color:#888">🟦 Train period:</span>
+          <strong>{train_s} → {train_e}</strong><br>
+          <span style="color:#888">🟨 Test period &nbsp;:</span>
+          <strong>{train_e} → {test_e}</strong><br>
+          <span style="color:#888">🎯 Predict for &nbsp;:</span>
+          <strong style="color:#2e75b6">{target_d} (+10 trading days)</strong>
+        </div>""", unsafe_allow_html=True)
+
+    if "date_ml_results" not in st.session_state:
+        st.session_state.date_ml_results  = None
+        st.session_state.date_ml_acc      = None
+        st.session_state.date_ml_date     = None
+
+    if run_date_ml:
+        prog2 = st.empty()
+        with st.spinner("Fetching 3 years of data for 50 stocks..."):
+            raw_df2 = fetch_ml_history(prog2)
+
+        if raw_df2.empty:
+            st.error("Could not fetch price data.")
+        else:
+            with st.spinner("Training on selected window + generating predictions..."):
+                date_pred, test_acc = run_date_ml_pipeline(raw_df2, chosen_date, forward_n=FORWARD_N)
+
+            if date_pred is None:
+                st.error("Not enough data in the selected date range. Try an earlier date.")
+            else:
+                st.session_state.date_ml_results = date_pred
+                st.session_state.date_ml_acc     = test_acc
+                st.session_state.date_ml_date    = chosen_date
+                st.success(
+                    f"Done! Model test accuracy: **{test_acc}%** on "
+                    f"[{train_e} → {test_e}] window."
+                )
+
+    if st.session_state.date_ml_results is not None:
+        date_pred = st.session_state.date_ml_results
+        test_acc  = st.session_state.date_ml_acc
+        sel_date  = st.session_state.date_ml_date
+
+        # Summary metrics
+        bull_n2 = (date_pred["Predicted_Direction"] == "BULL").sum()
+        bear_n2 = (date_pred["Predicted_Direction"] == "BEAR").sum()
+        avg_ret2 = date_pred["Predicted_Return_Pct"].mean()
+
+        dm1, dm2, dm3, dm4 = st.columns(4, gap="small")
+        dm1.metric("BULL",              int(bull_n2))
+        dm2.metric("BEAR",              int(bear_n2))
+        dm3.metric("Avg Predicted Ret", f"{avg_ret2:+.2f}%")
+        dm4.metric("Test Accuracy",     f"{test_acc}%" if test_acc else "—")
+        st.divider()
+
+        # Filter
+        df1, df2 = st.columns([2, 2])
+        with df1:
+            dir_f2 = st.selectbox("Direction", ["All","BULL","BEAR"], key="date_ml_dir")
+        with df2:
+            sort_f2 = st.selectbox("Sort by", ["Predicted_Return_Pct","Bull_Probability","Predicted_Price"], key="date_ml_sort")
+
+        disp2 = date_pred.copy()
+        if dir_f2 != "All":
+            disp2 = disp2[disp2["Predicted_Direction"] == dir_f2]
+        disp2 = disp2.sort_values(sort_f2, ascending=(sort_f2 == "Predicted_Price"))
+
+        # Table
+        rows2 = []
+        for _, row in disp2.iterrows():
+            stock    = str(row["Stock"]).replace(".NS", "")
+            dir_val  = str(row["Predicted_Direction"])
+            prob     = float(row["Bull_Probability"])
+            ret      = float(row["Predicted_Return_Pct"])
+            close_p  = row["Close"]
+            pred_p   = row["Predicted_Price"]
+            tgt_date = row["Target_Date"]
+
+            dir_badge  = (f'<span class="badge-buy">{dir_val}</span>' if dir_val == "BULL"
+                          else f'<span class="badge-sell">{dir_val}</span>')
+            prob_color = "#008a58" if prob >= 0.6 else ("#e07c00" if prob >= 0.5 else "#c24141")
+            ret_cls    = "up" if ret > 0 else "dn"
+            price_cls  = "up" if pred_p > close_p else "dn"
+
+            rows2.append(f"""<tr>
+              <td><strong>{stock}</strong></td>
+              <td>{fmt(close_p)}</td>
+              <td><span class="{price_cls}">{fmt(pred_p)}</span></td>
+              <td>{tgt_date}</td>
+              <td>{dir_badge}</td>
+              <td><span style="color:{prob_color};font-weight:700">{prob:.2%}</span></td>
+              <td><span class="{ret_cls}">{ret:+.2f}%</span></td>
+            </tr>""")
+
+        st.markdown(f"""
+        <div class="tbl-wrap">
+          <table class="screener-table">
+            <thead><tr>
+              <th>Stock</th>
+              <th>Close (as of {sel_date})</th>
+              <th>Predicted Price</th>
+              <th>Target Date</th>
+              <th>Direction</th>
+              <th>Bull Prob</th>
+              <th>Pred Return</th>
+            </tr></thead>
+            <tbody>{"".join(rows2)}</tbody>
+          </table>
+        </div>""", unsafe_allow_html=True)
+        st.caption(f"{len(disp2)} stocks · predictions for {date_pred['Target_Date'].iloc[0]}")
+        st.download_button("⬇ Download CSV", disp2.to_csv(index=False),
+            file_name=f"ml_date_predictions_{sel_date}.csv", mime="text/csv")
