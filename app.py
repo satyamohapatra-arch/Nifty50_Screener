@@ -31,19 +31,14 @@ SCOPES = [
 ]
 PRESETS_FILE = "presets_nifty50.json"
 
-NIFTY50_TICKERS = [
-    "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK",
-    "INFOSYS","SBILIFE","HINDUNILVR","ITC","LT",
-    "KOTAKBANK","HCLTECH","BAJFINANCE","MARUTI","AXISBANK",
-    "ASIANPAINT","NESTLEIND","SUNPHARMA","TITAN","ULTRACEMCO",
-    "WIPRO","NTPC","TECHM","POWERGRID","BAJAJFINSV",
-    "ADANIENT","ADANIPORTS","ONGC","TATAMOTORS","TATASTEEL",
-    "SBIN","M&M","JSWSTEEL","COALINDIA","DIVISLAB",
-    "DRREDDY","BRITANNIA","CIPLA","APOLLOHOSP","EICHERMOT",
-    "GRASIM","HEROMOTOCO","HINDALCO","INDUSINDBK","BPCL",
-    "BAJAJ-AUTO","TRENT","BEL","SHRIRAMFIN","HDFCLIFE",
-]
-NIFTY50_SYMBOLS = [t + ".NS" for t in NIFTY50_TICKERS]
+def load_tickers(csv_path="ind_nifty50list.csv"):
+    df = pd.read_csv(csv_path)
+    df.columns = df.columns.str.strip()
+    df = df.dropna(subset=["Symbol"])
+    tickers = df["Symbol"].str.strip().tolist()
+    return tickers, [t + ".NS" for t in tickers]
+
+NIFTY50_TICKERS, NIFTY50_SYMBOLS = load_tickers()
 
 FORWARD_N = 10  # days ahead for ML label
 
