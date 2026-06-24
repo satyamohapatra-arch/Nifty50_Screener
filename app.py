@@ -83,6 +83,13 @@ ALL_INDICATORS = {
     "Bottom Fishing Flag":  ("Bottom_Fishing",   None, None,  None),
 }
 
+# Numeric-only indicators available for column-vs-column comparisons
+NUMERIC_INDICATORS = {
+    label: (col, vmin, vmax, vdefault)
+    for label, (col, vmin, vmax, vdefault) in ALL_INDICATORS.items()
+    if vmin is not None  # excludes text/flag columns
+}
+
 STRATEGY_PRESETS = {
     "🚀 Absolute Longs": {
         "description": "High-conviction trend-following. Full bullish convergence across EMA, RSI, MACD, and Supertrend.",
@@ -172,6 +179,9 @@ section[data-testid="stSidebar"] {
 .metric-card .mc-value.negative { color:#c24141; }
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 10px; }
+/* col-vs-col pill */
+.badge-col { display:inline-flex; align-items:center; padding:2px 8px; border-radius:999px;
+             background:#fff8e1; color:#b8860b; font-size:11px; font-weight:700; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -209,6 +219,18 @@ def flag_badge(val):
     if v == "YES": return '<span class="badge-yes">✓ YES</span>'
     return '<span class="badge-no">—</span>'
 
+def filter_display_label(f):
+    """Human-readable label for an active filter (value or column comparison)."""
+    col  = f["col"]
+    op   = f["op"]
+    if "compare_col" in f:
+        cmp_col   = f["compare_col"]
+        cmp_label = f.get("compare_label", cmp_col)
+        return f"`{f['label']}` {op} `{cmp_label}` <span class='badge-col'>col vs col</span>"
+    else:
+        v = f["val"] if isinstance(f["val"], str) else f"{f['val']:.2f}"
+        return f"`{f['label']}` {op} {v}"
+
 # ── AUTH & DATA ───────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_gc():
@@ -239,23 +261,48 @@ def load_data():
 
 # ── FILTER ENGINE ─────────────────────────────────────────────────────────────
 def apply_filters(df, filters, logic):
+    """
+    Supports two filter modes per entry:
+      • Value mode  : {"col": ..., "op": ..., "val": ...}
+      • Column mode : {"col": ..., "op": ..., "compare_col": ...}
+    """
     if not filters:
         return df
     masks = []
     for f in filters:
-        col, op, val = f["col"], f["op"], f["val"]
+        col = f["col"]
+        op  = f["op"]
+
         if col not in df.columns:
             continue
-        if op == "==" and isinstance(val, str):
-            masks.append(df[col].astype(str).str.upper() == val.upper())
-        elif op == ">":
-            masks.append(pd.to_numeric(df[col], errors="coerce") > float(val))
-        elif op == "<":
-            masks.append(pd.to_numeric(df[col], errors="coerce") < float(val))
-        elif op == ">=":
-            masks.append(pd.to_numeric(df[col], errors="coerce") >= float(val))
-        elif op == "<=":
-            masks.append(pd.to_numeric(df[col], errors="coerce") <= float(val))
+
+        # ── Column-vs-Column ─────────────────────────────────────────────────
+        if "compare_col" in f:
+            cmp_col = f["compare_col"]
+            if cmp_col not in df.columns:
+                continue
+            left  = pd.to_numeric(df[col],     errors="coerce")
+            right = pd.to_numeric(df[cmp_col], errors="coerce")
+            if   op == ">":  masks.append(left >  right)
+            elif op == "<":  masks.append(left <  right)
+            elif op == ">=": masks.append(left >= right)
+            elif op == "<=": masks.append(left <= right)
+            elif op == "==": masks.append(left == right)
+
+        # ── Column-vs-Value ──────────────────────────────────────────────────
+        else:
+            val = f["val"]
+            if op == "==" and isinstance(val, str):
+                masks.append(df[col].astype(str).str.upper() == val.upper())
+            elif op == ">":
+                masks.append(pd.to_numeric(df[col], errors="coerce") > float(val))
+            elif op == "<":
+                masks.append(pd.to_numeric(df[col], errors="coerce") < float(val))
+            elif op == ">=":
+                masks.append(pd.to_numeric(df[col], errors="coerce") >= float(val))
+            elif op == "<=":
+                masks.append(pd.to_numeric(df[col], errors="coerce") <= float(val))
+
     if not masks:
         return df
     combined = masks[0]
@@ -312,7 +359,6 @@ def compute_bt_indicators(data):
     macd_line = ema12 - ema26
     data["MACD_hist"] = macd_line - macd_line.ewm(span=9, adjust=False).mean()
 
-    # Supertrend (ATR multiplier=3, span=7 — matching the Colab notebook)
     hl  = high - low
     hcp = (high - close.shift()).abs()
     lcp = (low  - close.shift()).abs()
@@ -340,11 +386,6 @@ def compute_bt_indicators(data):
     return data
 
 def run_backtest(raw_df, strategy="absolute_longs"):
-    """
-    Exact same logic as the notebook.
-    strategy: 'absolute_longs' or 'bottom_fishing'
-    Pool all stocks together, compute aggregate metrics.
-    """
     frames = []
     for stock, grp in raw_df.groupby("Stock"):
         result = compute_bt_indicators(grp.copy())
@@ -359,7 +400,7 @@ def run_backtest(raw_df, strategy="absolute_longs"):
             (bt["MACD_hist"] > 0) &
             (bt["Supertrend_Signal"] == "BUY")
         ).astype(int)
-    else:  # bottom_fishing
+    else:
         bt["Position"] = (
             (bt["EMA_10"] < bt["EMA_20"]) &
             (bt["RSI_14"] < 50) &
@@ -371,7 +412,6 @@ def run_backtest(raw_df, strategy="absolute_longs"):
     bt["Strategy_Return"] = bt["Position"] * bt["Daily_Return"]
 
     returns = bt["Strategy_Return"].dropna()
-
     initial_capital = 100_000
     equity_curve    = initial_capital * (1 + returns).cumprod()
 
@@ -391,10 +431,10 @@ def run_backtest(raw_df, strategy="absolute_longs"):
 
     calmar = cagr / abs(max_drawdown) if max_drawdown != 0 else np.inf
 
-    trades       = bt.loc[bt["Position"] == 1, "Strategy_Return"].dropna()
-    win_rate     = (trades > 0).sum() / len(trades) * 100 if len(trades) > 0 else 0
-    gross_profit = trades[trades > 0].sum()
-    gross_loss   = abs(trades[trades < 0].sum())
+    trades        = bt.loc[bt["Position"] == 1, "Strategy_Return"].dropna()
+    win_rate      = (trades > 0).sum() / len(trades) * 100 if len(trades) > 0 else 0
+    gross_profit  = trades[trades > 0].sum()
+    gross_loss    = abs(trades[trades < 0].sum())
     profit_factor = gross_profit / gross_loss if gross_loss != 0 else np.inf
 
     benchmark_returns = bt.groupby("Date")["Daily_Return"].mean().dropna()
@@ -425,7 +465,6 @@ def run_backtest(raw_df, strategy="absolute_longs"):
 
 # ── ML: FETCH HISTORY ─────────────────────────────────────────────────────────
 def fetch_ml_history(progress_placeholder):
-    """Fetch 3 years OHLCV for all Nifty 50 — needed for enough training rows."""
     end   = datetime.today()
     start = end - timedelta(days=3 * 365)
     frames = []
@@ -518,7 +557,6 @@ def compute_ml_indicators(data):
     data["Returns"]    = close.pct_change() * 100
     data["Volatility"] = data["Returns"].rolling(20).std()
 
-    # Supertrend for flag feature
     atr7       = tr.ewm(span=7, adjust=False).mean()
     hl2        = (high + low) / 2
     upper_band = (hl2 + 3 * atr7).values
@@ -539,16 +577,6 @@ def compute_ml_indicators(data):
 
 # ── ML: DATE-BASED PIPELINE ──────────────────────────────────────────────────
 def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
-    """
-    Given a chosen date D:
-      Train  : D - 6months → D - 2months
-      Test   : D - 2months → D
-      Predict: 10 trading days after D (future price per stock)
-
-    Returns:
-      pred_df  — all stocks with predicted price / return / direction
-      test_acc — model accuracy on test period (direction accuracy %)
-    """
     from pandas.tseries.offsets import BDay
 
     D        = pd.Timestamp(chosen_date)
@@ -557,7 +585,6 @@ def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
     test_start  = train_end
     test_end    = D
 
-    # Compute indicators per stock
     frames = []
     for stock, grp in raw_df.groupby("Stock"):
         result = compute_ml_indicators(grp.copy())
@@ -570,11 +597,9 @@ def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
     feat_cols = [f for f in ML_FEATURES if f in combined.columns] + ["_st_flag"]
     combined["_st_flag"] = (combined["Supertrend_Signal"] == "BUY").astype(int)
 
-    # ── TRAIN set ─────────────────────────────────────────────────────────────
     train_mask = (combined["Date"] >= train_start) & (combined["Date"] < train_end)
     train_data = combined[train_mask].copy()
 
-    # Forward return label: next 10 trading days
     train_data["_fwd_close"]      = train_data.groupby("Stock")["Close"].shift(-forward_n)
     train_data["_fwd_return_pct"] = (train_data["_fwd_close"] - train_data["Close"]) / (train_data["Close"] + 1e-10) * 100
     train_data["_label_dir"]      = (train_data["_fwd_return_pct"] > 0).astype(int)
@@ -585,7 +610,7 @@ def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
     y_reg   = train_clean["_fwd_return_pct"]
 
     if len(X_train) < 50:
-        return None, None  # not enough data
+        return None, None
 
     clf = XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.05,
                         subsample=0.8, colsample_bytree=0.8,
@@ -597,7 +622,6 @@ def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
                        eval_metric="rmse", random_state=42, n_jobs=-1)
     reg.fit(X_train, y_reg)
 
-    # ── TEST accuracy (May 1 → D window) ──────────────────────────────────────
     test_mask = (combined["Date"] >= test_start) & (combined["Date"] < test_end)
     test_data = combined[test_mask].copy()
     test_data["_fwd_close"]      = test_data.groupby("Stock")["Close"].shift(-forward_n)
@@ -611,7 +635,6 @@ def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
         test_preds = clf.predict(X_test)
         test_acc   = round((test_preds == y_test.values).mean() * 100, 2)
 
-    # ── PREDICT: latest row per stock on or before D ───────────────────────────
     before_d   = combined[combined["Date"] <= test_end]
     latest_idx = before_d.groupby("Stock")["Date"].idxmax()
     pred_df    = combined.loc[latest_idx].copy()
@@ -623,7 +646,6 @@ def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
     pred_df["Predicted_Return_Pct"] = reg.predict(X_pred).round(2)
     pred_df["Predicted_Price"]      = (pred_df["Close"] * (1 + pred_df["Predicted_Return_Pct"] / 100)).round(2)
 
-    # Strategy flags
     pred_df["Absolute_Longs"] = (
         (pred_df["EMA_10"] > pred_df["EMA_20"]) &
         (pred_df["RSI_14"] > 50) &
@@ -638,7 +660,6 @@ def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
         (pred_df["Supertrend_Signal"] == "SELL")
     ).map({True: "YES", False: "NO"})
 
-    # Target date = D + 10 trading days
     target_date = D + BDay(forward_n)
     pred_df["Target_Date"]      = target_date.strftime("%Y-%m-%d")
     pred_df["As_Of_Date"]       = D.strftime("%Y-%m-%d")
@@ -702,18 +723,68 @@ with st.sidebar:
                     st.rerun()
 
     st.divider()
+
+    # ── CUSTOM FILTERS ────────────────────────────────────────────────────────
     st.markdown("**🔧 Custom Filters**")
-    sel = st.selectbox("Indicator", list(ALL_INDICATORS.keys()), label_visibility="collapsed")
+
+    # Left indicator (always shown)
+    sel = st.selectbox("Indicator", list(ALL_INDICATORS.keys()),
+                       key="cf_left", label_visibility="collapsed")
     col_name, vmin, vmax, vdefault = ALL_INDICATORS[sel]
-    is_text = vmin is None
-    if is_text:
-        op  = "=="
-        val = st.selectbox("Value", ["BUY","SELL","YES","NO"])
+    is_text_col = vmin is None  # Supertrend Signal, flag columns
+
+    # Compare mode toggle — only available for numeric columns
+    if not is_text_col:
+        compare_mode = st.radio(
+            "Compare to",
+            ["Value", "Column"],
+            horizontal=True,
+            key="cf_mode",
+            help="Value: compare against a fixed number · Column: compare against another indicator",
+        )
     else:
-        op  = st.selectbox("Operator", [">","<",">=","<="])
-        val = st.number_input("Threshold", value=float(vdefault), step=0.1, format="%.2f")
+        compare_mode = "Value"
+
+    # Operator
+    if is_text_col:
+        op = "=="
+    else:
+        op = st.selectbox("Operator", [">", "<", ">=", "<=", "=="], key="cf_op")
+
+    # Right-hand side: value or column picker
+    if compare_mode == "Column":
+        # Exclude the selected left column from the right-hand picker
+        rhs_options = {
+            label: meta
+            for label, meta in NUMERIC_INDICATORS.items()
+            if meta[0] != col_name
+        }
+        rhs_label = st.selectbox("Compare Column", list(rhs_options.keys()), key="cf_right_col")
+        rhs_col   = rhs_options[rhs_label][0]
+    else:
+        if is_text_col:
+            val = st.selectbox("Value", ["BUY", "SELL", "YES", "NO"], key="cf_val_text")
+        else:
+            val = st.number_input("Threshold", value=float(vdefault),
+                                  step=0.1, format="%.2f", key="cf_val_num")
+
     if st.button("＋ Add Filter", use_container_width=True, type="primary"):
-        st.session_state.filters.append({"label": sel, "col": col_name, "op": op, "val": val})
+        if compare_mode == "Column":
+            new_filter = {
+                "label":         sel,
+                "col":           col_name,
+                "op":            op,
+                "compare_col":   rhs_col,
+                "compare_label": rhs_label,
+            }
+        else:
+            new_filter = {
+                "label": sel,
+                "col":   col_name,
+                "op":    op,
+                "val":   val,
+            }
+        st.session_state.filters.append(new_filter)
         st.session_state.active_preset = None
         st.rerun()
 
@@ -726,15 +797,14 @@ with st.sidebar:
         st.markdown("**Active Filters**")
         to_remove = []
         for i, f in enumerate(st.session_state.filters):
-            c1, c2 = st.columns([4,1])
+            c1, c2 = st.columns([4, 1])
             with c1:
-                v = f["val"] if isinstance(f["val"], str) else f"{f['val']:.2f}"
-                st.caption(f"`{f['label']}` {f['op']} {v}")
+                st.markdown(filter_display_label(f), unsafe_allow_html=True)
             with c2:
                 if st.button("✕", key=f"rm_{i}"):
                     to_remove.append(i)
         if to_remove:
-            st.session_state.filters = [f for i,f in enumerate(st.session_state.filters) if i not in to_remove]
+            st.session_state.filters = [f for i, f in enumerate(st.session_state.filters) if i not in to_remove]
             st.rerun()
         if st.button("✕ Clear All", use_container_width=True):
             st.session_state.filters = []
@@ -756,7 +826,7 @@ with st.sidebar:
                 st.rerun()
     if st.session_state.presets:
         for pn, pd_ in list(st.session_state.presets.items()):
-            pc1, pc2 = st.columns([3,1])
+            pc1, pc2 = st.columns([3, 1])
             with pc1:
                 if st.button(f"▶ {pn}", key=f"load_{pn}", use_container_width=True):
                     st.session_state.filters = pd_["filters"].copy()
@@ -1161,7 +1231,6 @@ with tab_perf:
 with tab_ml:
     st.markdown("## 📅 Date-Based Prediction Panel")
 
-    # ── DATE-BASED PREDICTION PANEL ───────────────────────────────────────────    
     st.caption(
         "Pick a date D → Train on [D−6m, D−2m] → Validate on [D−2m, D] → "
         "Predict price 10 trading days after D"
@@ -1230,7 +1299,6 @@ with tab_ml:
         test_acc  = st.session_state.date_ml_acc
         sel_date  = st.session_state.date_ml_date
 
-        # Summary metrics
         bull_n2 = (date_pred["Predicted_Direction"] == "BULL").sum()
         bear_n2 = (date_pred["Predicted_Direction"] == "BEAR").sum()
         avg_ret2 = date_pred["Predicted_Return_Pct"].mean()
@@ -1242,7 +1310,6 @@ with tab_ml:
         dm4.metric("Test Accuracy",     f"{test_acc}%" if test_acc else "—")
         st.divider()
 
-        # Filter
         df1, df2 = st.columns([2, 2])
         with df1:
             dir_f2 = st.selectbox("Direction", ["All","BULL","BEAR"], key="date_ml_dir")
@@ -1258,7 +1325,6 @@ with tab_ml:
             disp2 = disp2[disp2["Predicted_Direction"] == dir_f2]
         disp2 = disp2.sort_values(sort_f2, ascending=(sort_f2 == "Predicted_Price"))
 
-        # Table
         rows2 = []
         for _, row in disp2.iterrows():
             stock      = str(row["Stock"]).replace(".NS", "")
